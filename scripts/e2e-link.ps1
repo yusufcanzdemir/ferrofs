@@ -35,35 +35,66 @@ function Send-Hotkey([string]$keys, [string]$where) {
   Start-Sleep -Seconds 2
 }
 
+# Isolated %APPDATA% with a custom pick hotkey; the real config is never touched.
+$appData = Join-Path $dir 'appdata'
+New-Item -ItemType Directory -Force (Join-Path $appData 'ferrofs') | Out-Null
+Set-Content (Join-Path $appData 'ferrofs\config.toml') "[hotkeys]`npick = `"Ctrl+Alt+P`"`n"
+$realAppData = $env:APPDATA
+$env:APPDATA = $appData
 $app = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden
+$env:APPDATA = $realAppData
 Start-Sleep -Seconds 2
 
-# 1) Explorer: Ctrl+B picks a file, Ctrl+G in another folder creates a symlink
+function Get-LinkInfo([string]$name) {
+  $item = Get-Item (Join-Path $target $name) -ErrorAction SilentlyContinue
+  if ($item) { "$($item.LinkType) -> $($item.Target)" } else { 'missing' }
+}
+
+# 1) The default Ctrl+B is replaced by the config, so it must not pick anything
 Start-Process explorer.exe "/select,`"$file`""
-Send-Hotkey '^b' 'Explorer (file selected)'
+Send-Hotkey '^b' 'Explorer (file selected, old hotkey)'
 Start-Process explorer.exe "`"$target`""
 Send-Hotkey '^g' 'Explorer (target folder)'
-$fileLink = Get-Item (Join-Path $target 'e2e-picked.txt') -ErrorAction SilentlyContinue
-"file link: $($fileLink.LinkType) -> $($fileLink.Target)"
+"after old hotkey: $(Get-LinkInfo 'e2e-picked.txt')"
 
-# 2) Folder: Ctrl+B on a folder, Ctrl+G creates a junction
+# 2) Configured Ctrl+Alt+P picks the file, Ctrl+G creates the default symlink
+Start-Process explorer.exe "/select,`"$file`""
+Send-Hotkey '^%p' 'Explorer (file selected)'
+Start-Process explorer.exe "`"$target`""
+Send-Hotkey '^g' 'Explorer (target folder)'
+"file link: $(Get-LinkInfo 'e2e-picked.txt')"
+
+# 3) Shift+Ctrl+G opens the link type menu: Esc cancels, H makes a hard link
+Send-Hotkey '+^g' 'Explorer (target folder, menu)'
+$wsh.SendKeys('{ESC}')
+Start-Sleep -Seconds 1
+"after Esc: $(Get-LinkInfo 'e2e-picked (link).txt')"
+Send-Hotkey '+^g' 'Explorer (target folder, menu)'
+$wsh.SendKeys('h')
+Start-Sleep -Seconds 2
+"hard link via menu: $(Get-LinkInfo 'e2e-picked (link).txt')"
+
+# 4) Folder: default drop makes a junction, the menu's S makes a folder symlink
 Start-Process explorer.exe "/select,`"$srcDir`""
-Send-Hotkey '^b' 'Explorer (folder selected)'
+Send-Hotkey '^%p' 'Explorer (folder selected)'
 Start-Process explorer.exe "`"$target`""
 Send-Hotkey '^g' 'Explorer (target folder)'
-$dirLink = Get-Item (Join-Path $target 'picked-folder') -ErrorAction SilentlyContinue
-"folder link: $($dirLink.LinkType) -> $($dirLink.Target)"
+"folder link: $(Get-LinkInfo 'picked-folder')"
 "read through junction: $(Get-Content (Join-Path $target 'picked-folder\inner.txt') -ErrorAction SilentlyContinue)"
+Send-Hotkey '+^g' 'Explorer (target folder, menu)'
+$wsh.SendKeys('s')
+Start-Sleep -Seconds 2
+"folder symlink via menu: $(Get-LinkInfo 'picked-folder (link)')"
 
-# 3) Notepad: Ctrl+B must pass through (no pick)
+# 5) Notepad: the pick hotkey must pass through (no pick)
 $np = Start-Process notepad.exe -PassThru
 Start-Sleep -Seconds 3
-"foreground before Ctrl+B in Notepad: $([W]::FgClass())"
-$wsh.SendKeys('^b')
+"foreground before Ctrl+Alt+P in Notepad: $([W]::FgClass())"
+$wsh.SendKeys('^%p')
 Start-Sleep -Seconds 1
 Stop-Process -Id $np.Id -Force -ErrorAction SilentlyContinue
 
-# 4) Graceful shutdown via WM_CLOSE
+# 6) Graceful shutdown via WM_CLOSE
 $h = [W]::FindWindow('ferrofs.link.tray', [NullString]::Value)
 [W]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
 $exited = $app.WaitForExit(5000)
@@ -72,4 +103,4 @@ if (-not $exited) { Stop-Process -Id $app.Id -Force }
 
 Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
 "--- log ---"
-Get-ChildItem $logDir | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content -Tail 14
+Get-ChildItem $logDir | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content -Tail 20
