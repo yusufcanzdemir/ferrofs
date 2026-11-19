@@ -14,6 +14,8 @@ try {
   $env:FERROFS_TEST_VOLUME = "${letter}:\"
   cargo test -q --release -p ferro-core --test usn_vhd -- --ignored --nocapture --test-threads=1 *>> $log
   "usn_vhd exit code: $LASTEXITCODE" | Add-Content $log
+  cargo test -q --release -p ferro-core --test mft_vhd -- --ignored --nocapture --test-threads=1 *>> $log
+  "mft_vhd exit code: $LASTEXITCODE" | Add-Content $log
 } catch {
   "ERROR: $_" | Add-Content $log
 } finally {
@@ -21,10 +23,11 @@ try {
   "test VHD removed" | Add-Content $log
 }
 
-"--- single-threaded enumeration ---" | Add-Content $log
-$env:FERROFS_SCAN_THREADS = '1'
+"--- USN enumeration ---" | Add-Content $log
+$env:FERROFS_SCAN_MODE = 'usn'
 cargo run -q --release -p ferro-core --example scan -- C:\ *>> $log
-Remove-Item Env:FERROFS_SCAN_THREADS
-"--- parallel enumeration ---" | Add-Content $log
+Remove-Item Env:FERROFS_SCAN_MODE
+"--- raw MFT ---" | Add-Content $log
+$env:FERROFS_SCAN_COMPARE = '1'
 cargo run -q --release -p ferro-core --example scan -- C:\ report "ext:pdf" "*.rs" "path:windows\system32 dll" *>> $log
 "scan exit code: $LASTEXITCODE" | Add-Content $log

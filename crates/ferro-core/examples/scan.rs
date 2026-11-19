@@ -14,13 +14,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = args.next().unwrap_or_else(|| "C:\\".to_owned());
 
     let started = Instant::now();
-    // FERROFS_SCAN_THREADS overrides the number of enumeration threads (for comparisons).
-    let (index, journal) = match std::env::var("FERROFS_SCAN_THREADS")
-        .ok()
-        .and_then(|t| t.parse().ok())
-    {
-        Some(threads) => usn::scan_with_threads(&root, FoldOptions::default(), threads)?,
-        None => usn::scan(&root, FoldOptions::default())?,
+    // FERROFS_SCAN_MODE=usn forces USN enumeration; FERROFS_SCAN_THREADS sets its threads.
+    let mode = std::env::var("FERROFS_SCAN_MODE").unwrap_or_default();
+    let (index, journal) = if mode != "usn" {
+        ferro_core::scan_volume(&root, FoldOptions::default())?
+    } else {
+        match std::env::var("FERROFS_SCAN_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+        {
+            Some(threads) => usn::scan_with_threads(&root, FoldOptions::default(), threads)?,
+            None => usn::scan(&root, FoldOptions::default())?,
+        }
     };
     let elapsed = started.elapsed();
     let entries = index.len().max(1) as f64;
@@ -36,6 +41,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         index.heap_bytes_without_names() as f64 / entries
     );
 
+    // FERROFS_SCAN_COMPARE=1: also enumerate through USN and list records only one side has.
+    if std::env::var("FERROFS_SCAN_COMPARE").as_deref() == Ok("1") {
+        let (other, _) = usn::scan(&root, FoldOptions::default())?;
+        let records = |index: &ferro_core::Index| {
+            (0..index.slot_count() as u32)
+                .filter(|&s| index.is_live(s))
+                .map(|s| (index.frn(s) & 0x0000_FFFF_FFFF_FFFF, index.path(s)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let (mine, theirs) = (records(&index), records(&other));
+        let only_here: Vec<_> = mine
+            .iter()
+            .filter(|(r, _)| !theirs.contains_key(r))
+            .collect();
+        let only_usn: Vec<_> = theirs
+            .iter()
+            .filter(|(r, _)| !mine.contains_key(r))
+            .collect();
+        println!(
+            "compare     only in this scan: {}, only in USN: {}",
+            only_here.len(),
+            only_usn.len()
+        );
+        for (record, path) in only_here.iter().take(8) {
+            println!("  this-only {record:>9} {path}");
+        }
+        for (record, path) in only_usn.iter().take(8) {
+            println!("  usn-only  {record:>9} {path}");
+        }
+    }
+
     for text in args {
         let query = Query::parse(&text, FoldOptions::default())?;
         let started = Instant::now();
@@ -43,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let took = started.elapsed();
         println!("\nquery {text:?}: {} matches in {took:.2?}", result.total);
         for slot in result.slots {
-            println!("  {}", index.path(slot));
+            println!("  {:>14} {}", index.size(slot), index.path(slot));
         }
     }
     Ok(())
