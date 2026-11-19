@@ -16,6 +16,11 @@ pub enum Error {
     NotNtfs(String),
     #[error("{0} is not a volume root such as `C:\\`")]
     BadRoot(String),
+    /// The MFT could not be read directly (callers fall back to USN enumeration).
+    #[error("cannot read the MFT: {0}")]
+    Mft(String),
+    #[error("snapshot: {0}")]
+    Snapshot(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

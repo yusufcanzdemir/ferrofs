@@ -4,11 +4,13 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
+use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
     GetVolumeNameForVolumeMountPointW, OPEN_EXISTING,
 };
+use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::core::{Owned, PCWSTR};
 
@@ -97,6 +99,12 @@ pub struct Volume {
     overlapped: bool,
 }
 
+// SAFETY: the handle is a kernel object usable from any thread; reads carry explicit
+// offsets (no shared file position) and FSCTLs are independent requests.
+unsafe impl Send for Volume {}
+// SAFETY: see above; `&Volume` only issues independent, thread-safe system calls.
+unsafe impl Sync for Volume {}
+
 impl Volume {
     /// Opens the volume whose root is `root` (`C:\`, or a GUID path `\\?\Volume{…}\`).
     pub fn open(root: &str) -> Result<Self> {
@@ -147,6 +155,39 @@ impl Volume {
 
     pub(crate) fn is_overlapped(&self) -> bool {
         self.overlapped
+    }
+
+    /// Reads `buf.len()` bytes at byte `offset` of the raw volume. Offset and length must
+    /// be multiples of the sector size. Only for handles opened with [`Volume::open`].
+    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let position = offset + done as u64;
+            let mut overlapped = OVERLAPPED::default();
+            // Splitting the position into the two 32-bit halves of OVERLAPPED.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                overlapped.Anonymous.Anonymous.Offset = position as u32;
+                overlapped.Anonymous.Anonymous.OffsetHigh = (position >> 32) as u32;
+            }
+            let mut read = 0u32;
+            // SAFETY: synchronous read on a non-overlapped handle; OVERLAPPED only carries
+            // the file position and `buf` is valid for the requested length.
+            unsafe {
+                ReadFile(
+                    *self.handle,
+                    Some(&mut buf[done..]),
+                    Some(&mut read),
+                    Some(&mut overlapped),
+                )
+            }
+            .win32("cannot read the volume")?;
+            if read == 0 {
+                return Err(Error::Mft("unexpected end of volume".into()));
+            }
+            done += read as usize;
+        }
+        Ok(())
     }
 }
 

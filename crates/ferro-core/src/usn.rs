@@ -218,8 +218,10 @@ pub fn scan_with_threads(
         Ok(())
     })?;
 
+    let orphans = index.remove_orphans();
     tracing::info!(
         root,
+        orphans,
         threads,
         records = count,
         entries = index.len(),
@@ -398,7 +400,7 @@ impl AlignedBuffer {
 }
 
 /// FSCTL with a fixed-size input and output struct.
-fn ioctl<I, O>(volume: &Volume, code: u32, input: &I, output: &mut O) -> Result<u32> {
+pub(crate) fn ioctl<I, O>(volume: &Volume, code: u32, input: &I, output: &mut O) -> Result<u32> {
     let in_size = u32::try_from(size_of::<I>()).unwrap_or(0);
     let out_size = u32::try_from(size_of::<O>()).unwrap_or(0);
     // SAFETY: the pointers reference live values of the stated sizes; `device_io` does not

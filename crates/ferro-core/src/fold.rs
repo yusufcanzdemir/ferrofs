@@ -4,7 +4,7 @@
 //! consults the system locale; Turkish dotless/dotted i is an explicit option.
 
 /// How names are folded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FoldOptions {
     /// Treat `ı` (dotless i) like `i`, so `IŞIK`, `ışık` and `isik`-style spellings
     /// with dotted `i` all match each other. `I` and `İ` always fold to `i`.

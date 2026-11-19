@@ -61,6 +61,8 @@ pub enum Name<'a> {
     Utf8(&'a str),
     /// NTFS names are UTF-16 and may contain unpaired surrogates (replaced by U+FFFD).
     Utf16(&'a [u16]),
+    /// UTF-16 little-endian bytes straight from an on-disk structure (no alignment needed).
+    Utf16Le(&'a [u8]),
 }
 
 /// One file or folder to insert or update.
@@ -78,7 +80,7 @@ pub struct NewEntry<'a> {
 }
 
 /// Index of one volume.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Index {
     /// e.g. `C:\`; prefix of every reconstructed path.
     volume_root: String,
@@ -267,6 +269,66 @@ impl Index {
         true
     }
 
+    /// Updates size, allocation, modification time and attributes of an existing entry
+    /// (e.g. after the file was written). Returns false if the record is unknown.
+    pub fn set_metadata(
+        &mut self,
+        frn: u64,
+        size: u64,
+        alloc_size: u64,
+        mtime: u64,
+        attributes: u32,
+    ) -> bool {
+        let Some(slot) = self.lookup(frn) else {
+            return false;
+        };
+        let s = slot as usize;
+        self.size[s] = size;
+        self.alloc_size[s] = alloc_size;
+        self.mtime[s] = mtime;
+        self.flags[s] = flags::from_attributes(attributes);
+        true
+    }
+
+    /// Updates only the stream sizes of an existing entry.
+    pub fn set_sizes(&mut self, frn: u64, size: u64, alloc_size: u64) -> bool {
+        let Some(slot) = self.lookup(frn) else {
+            return false;
+        };
+        self.size[slot as usize] = size;
+        self.alloc_size[slot as usize] = alloc_size;
+        true
+    }
+
+    /// Removes entries whose parent folder is not indexed (and, transitively, their
+    /// children). After a full scan these are NTFS-internal items under `$Extend`, which
+    /// would otherwise show up at the volume root. Returns how many were removed.
+    pub fn remove_orphans(&mut self) -> usize {
+        let mut removed = 0;
+        loop {
+            let orphans: Vec<u64> = (0..self.slot_count())
+                .filter(|&s| self.flags[s] & flags::FREE == 0)
+                .filter(|&s| {
+                    let parent = self.parent[s];
+                    parent != ROOT_RECORD
+                        && self
+                            .frn_to_slot
+                            .get(parent as usize)
+                            .is_none_or(|&p| p == NONE)
+                })
+                .map(|s| self.frn[s])
+                .collect();
+            if orphans.is_empty() {
+                return removed;
+            }
+            for frn in orphans {
+                if self.remove(frn) {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
     /// Slot of a file reference number (only the record number part is used).
     pub fn lookup(&self, frn: u64) -> Option<u32> {
         let record = usize::try_from(record_number(frn)).ok()?;
@@ -412,6 +474,24 @@ impl Index {
         *self = next;
     }
 
+    /// Releases spare capacity (e.g. after deserializing, where vectors grow by doubling).
+    pub fn shrink_to_fit(&mut self) {
+        self.frn_to_slot.shrink_to_fit();
+        self.frn.shrink_to_fit();
+        self.parent.shrink_to_fit();
+        self.name_off.shrink_to_fit();
+        self.name_len.shrink_to_fit();
+        self.fold_off.shrink_to_fit();
+        self.fold_len.shrink_to_fit();
+        self.size.shrink_to_fit();
+        self.alloc_size.shrink_to_fit();
+        self.mtime.shrink_to_fit();
+        self.flags.shrink_to_fit();
+        self.name_pool.shrink_to_fit();
+        self.fold_pool.shrink_to_fit();
+        self.free.shrink_to_fit();
+    }
+
     /// Heap bytes held by the index (capacity, not just length).
     pub fn heap_bytes(&self) -> usize {
         self.frn_to_slot.capacity() * 4
@@ -434,18 +514,26 @@ impl Index {
     }
 }
 
+fn push_utf16(pool: &mut Vec<u8>, units: impl Iterator<Item = u16>) {
+    let mut buf = [0u8; 4];
+    for c in char::decode_utf16(units) {
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        pool.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
 /// Appends a name to the pool as UTF-8 without allocating; returns (offset, length).
 fn append_name(pool: &mut Vec<u8>, name: Name<'_>) -> Option<(u32, u16)> {
     let off = pool.len();
     match name {
         Name::Utf8(s) => pool.extend_from_slice(s.as_bytes()),
-        Name::Utf16(units) => {
-            let mut buf = [0u8; 4];
-            for c in char::decode_utf16(units.iter().copied()) {
-                let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
-                pool.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-        }
+        Name::Utf16(units) => push_utf16(pool, units.iter().copied()),
+        Name::Utf16Le(bytes) => push_utf16(
+            pool,
+            bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]])),
+        ),
     }
     let len = u16::try_from(pool.len() - off).ok();
     let off = u32::try_from(off).ok();
@@ -534,6 +622,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn utf16le_bytes_and_metadata_updates() {
+        let mut index = Index::new("C:\\", FoldOptions::default());
+        let bytes: Vec<u8> = "Ödev.pdf"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let slot = index
+            .upsert(&NewEntry {
+                name: Name::Utf16Le(&bytes[1..]), // deliberately unaligned slice start
+                ..entry(9, 5, "", 0)
+            })
+            .unwrap();
+        assert_ne!(index.name(slot), "Ödev.pdf"); // shifted by one byte: garbage, not a panic
+        let slot = index
+            .upsert(&NewEntry {
+                name: Name::Utf16Le(&bytes),
+                ..entry(9, 5, "", 0)
+            })
+            .unwrap();
+        assert_eq!(index.name(slot), "Ödev.pdf");
+        assert!(index.set_metadata(9, 1234, 4096, 77, 0x20));
+        assert_eq!(
+            (index.size(slot), index.alloc_size(slot), index.mtime(slot)),
+            (1234, 4096, 77)
+        );
+        assert!(!index.set_metadata(999, 1, 1, 1, 0));
+    }
+
+    #[test]
     fn utf16_names_with_invalid_surrogates() {
         let mut index = Index::new("D:\\", FoldOptions::default());
         let name: Vec<u16> = "Şehir".encode_utf16().chain([0xD800]).collect();
@@ -579,6 +696,18 @@ pub(crate) mod tests {
             out,
             crate::fold::fold(&index.path(slot), FoldOptions::default())
         );
+    }
+
+    #[test]
+    fn orphans_are_removed_transitively() {
+        let mut index = sample();
+        index.upsert(&entry(70, 11, "$RmMetadata", DIR)).unwrap(); // parent $Extend: not indexed
+        index.upsert(&entry(71, 70, "$Repair", DIR)).unwrap();
+        index.upsert(&entry(72, 71, "deep.bin", 0)).unwrap();
+        assert_eq!(index.remove_orphans(), 3);
+        assert_eq!(index.len(), 6);
+        assert!(index.lookup(72).is_none());
+        assert_eq!(index.remove_orphans(), 0);
     }
 
     #[test]

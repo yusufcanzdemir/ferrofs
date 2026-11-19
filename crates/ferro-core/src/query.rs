@@ -10,6 +10,7 @@ use rayon::prelude::*;
 
 use crate::fold::{FoldOptions, fold, fold_into};
 use crate::index::Index;
+use crate::time;
 
 /// Why a query could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -62,6 +63,16 @@ enum Term {
     Path(Box<Finder<'static>>),
     /// Matched against the folded name; compiled once and shared by all workers.
     Regex(Box<regex::bytes::Regex>),
+    /// File size in bytes, inclusive range (folders never match).
+    Size {
+        min: u64,
+        max: u64,
+    },
+    /// Last write time (FILETIME), inclusive range; entries without a time never match.
+    Modified {
+        min: u64,
+        max: u64,
+    },
 }
 
 impl Term {
@@ -265,6 +276,115 @@ fn fold_regex_literals(pattern: &str, options: FoldOptions) -> String {
     out
 }
 
+/// `1.5mb`, `10 kb`, `300` (bytes); 1024-based units.
+fn parse_bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(text.len());
+    let number: f64 = text[..split].trim().parse().ok()?;
+    let unit: u64 = match text[split..].to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        "t" | "tb" => 1 << 40,
+        _ => return None,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    // Bounded by the checks above; rounding to whole bytes is intended.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let bytes = (number * unit as f64).round() as u64;
+    Some(bytes)
+}
+
+/// `size:` value -> inclusive byte range: `>1mb`, `>=1mb`, `<10kb`, `<=10kb`, `=5`, `5`,
+/// `1mb..10mb`, `..1kb`, `empty`.
+fn parse_size_range(value: &str) -> Option<(u64, u64)> {
+    if value.eq_ignore_ascii_case("empty") {
+        return Some((0, 0));
+    }
+    if let Some((low, high)) = value.split_once("..") {
+        let low = if low.is_empty() { 0 } else { parse_bytes(low)? };
+        let high = if high.is_empty() {
+            u64::MAX
+        } else {
+            parse_bytes(high)?
+        };
+        return (low <= high).then_some((low, high));
+    }
+    if let Some(rest) = value.strip_prefix(">=") {
+        return Some((parse_bytes(rest)?, u64::MAX));
+    }
+    if let Some(rest) = value.strip_prefix("<=") {
+        return Some((0, parse_bytes(rest)?));
+    }
+    if let Some(rest) = value.strip_prefix('>') {
+        return Some((parse_bytes(rest)?.saturating_add(1), u64::MAX));
+    }
+    if let Some(rest) = value.strip_prefix('<') {
+        return parse_bytes(rest)?.checked_sub(1).map(|high| (0, high));
+    }
+    let exact = parse_bytes(value.strip_prefix('=').unwrap_or(value))?;
+    Some((exact, exact))
+}
+
+/// Start and end (inclusive) FILETIME of a local calendar day.
+fn day_range((y, m, d): (u16, u16, u16)) -> Option<(u64, u64)> {
+    Some((
+        time::local_midnight(y, m, d)?,
+        time::next_local_midnight(y, m, d)? - 1,
+    ))
+}
+
+/// `dm:` value -> inclusive FILETIME range: `today`, `yesterday`, `week`, `month`, `year`
+/// (the last 7/30/365 days), `2025-01-31`, `2025-01-01..2025-02-01`, `..2025-02-01`,
+/// `>2025-01-01`, `>=…`, `<…`, `<=…`.
+fn parse_date_range(value: &str) -> Option<(u64, u64)> {
+    let now = time::now();
+    let last_days = |days: u64| Some((now.saturating_sub(days * time::DAY), u64::MAX));
+    match value.to_ascii_lowercase().as_str() {
+        "today" => return day_range(time::today()),
+        "yesterday" => {
+            let (y, m, d) = time::today();
+            return day_range(time::previous_day(y, m, d));
+        }
+        "week" => return last_days(7),
+        "month" => return last_days(30),
+        "year" => return last_days(365),
+        _ => {}
+    }
+    let day = |text: &str| time::parse_date(text).and_then(day_range);
+    if let Some((low, high)) = value.split_once("..") {
+        let low = if low.is_empty() { 0 } else { day(low)?.0 };
+        let high = if high.is_empty() {
+            u64::MAX
+        } else {
+            day(high)?.1
+        };
+        return (low <= high).then_some((low, high));
+    }
+    if let Some(rest) = value.strip_prefix(">=") {
+        return Some((day(rest)?.0, u64::MAX));
+    }
+    if let Some(rest) = value.strip_prefix("<=") {
+        return Some((0, day(rest)?.1));
+    }
+    if let Some(rest) = value.strip_prefix('>') {
+        return Some((day(rest)?.1 + 1, u64::MAX));
+    }
+    if let Some(rest) = value.strip_prefix('<') {
+        return Some((0, day(rest)?.0.checked_sub(1)?));
+    }
+    day(value)
+}
+
 fn is_boundary(byte: u8) -> bool {
     byte.is_ascii() && !byte.is_ascii_alphanumeric()
 }
@@ -314,8 +434,16 @@ fn parse_word(
                     .map_err(|e| QueryError::InvalidRegex(e.to_string()))?;
                 Term::Regex(Box::new(regex))
             }
-            // Milestone 5 (raw MFT parser) provides sizes and timestamps.
-            "size" | "dm" | "dc" | "da" => return Err(QueryError::NotSupportedYet(filter)),
+            "size" => {
+                let (min, max) = parse_size_range(value).ok_or_else(invalid)?;
+                Term::Size { min, max }
+            }
+            "dm" | "datemodified" => {
+                let (min, max) = parse_date_range(value).ok_or_else(invalid)?;
+                Term::Modified { min, max }
+            }
+            // Creation and access times are not kept in the index.
+            "dc" | "da" => return Err(QueryError::NotSupportedYet(filter)),
             _ => return Err(QueryError::UnknownFilter(filter)),
         };
         return Ok(Node::Leaf(term));
@@ -372,6 +500,13 @@ fn eval(node: &Node, index: &Index, slot: u32, scratch: &mut Scratch) -> bool {
                 exts.iter().any(|e| e.as_slice() == ext)
             }
             Term::Regex(regex) => regex.is_match(index.folded_name(slot)),
+            Term::Size { min, max } => {
+                !index.is_dir(slot) && (*min..=*max).contains(&index.size(slot))
+            }
+            Term::Modified { min, max } => {
+                let mtime = index.mtime(slot);
+                mtime != 0 && (*min..=*max).contains(&mtime)
+            }
             Term::Path(finder) => {
                 if !scratch.path_ready {
                     index.folded_path_into(slot, &mut scratch.chain, &mut scratch.path);
@@ -658,13 +793,21 @@ mod tests {
     fn parse_errors() {
         let parse = |q| Query::parse(q, FoldOptions::default()).map(|_| ());
         assert_eq!(
-            parse("size:>1mb"),
-            Err(QueryError::NotSupportedYet("size".into()))
+            parse("dc:today"),
+            Err(QueryError::NotSupportedYet("dc".into()))
         );
-        assert_eq!(
-            parse("dm:today"),
-            Err(QueryError::NotSupportedYet("dm".into()))
-        );
+        assert!(matches!(
+            parse("size:big"),
+            Err(QueryError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            parse("dm:2024-02-30"),
+            Err(QueryError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            parse("size:10mb..1kb"),
+            Err(QueryError::InvalidValue { .. })
+        ));
         assert_eq!(
             parse("foo:bar"),
             Err(QueryError::UnknownFilter("foo".into()))
@@ -708,6 +851,57 @@ mod tests {
             r"(?U)a+(?P<Name>b)"
         );
         assert_eq!(fold_regex_literals("IŞIK", tr), "işik");
+    }
+
+    #[test]
+    fn size_values() {
+        assert_eq!(parse_size_range(">1mb"), Some((1_048_577, u64::MAX)));
+        assert_eq!(parse_size_range(">=1MB"), Some((1_048_576, u64::MAX)));
+        assert_eq!(parse_size_range("<1kb"), Some((0, 1023)));
+        assert_eq!(parse_size_range("1.5k"), Some((1536, 1536)));
+        assert_eq!(parse_size_range("10kb..1mb"), Some((10_240, 1_048_576)));
+        assert_eq!(parse_size_range("..100"), Some((0, 100)));
+        assert_eq!(parse_size_range("empty"), Some((0, 0)));
+        assert_eq!(parse_size_range("<0"), None);
+        assert_eq!(parse_size_range("5 parsecs"), None);
+    }
+
+    #[test]
+    fn size_and_date_filters() {
+        let mut index = Index::new("C:\\", FoldOptions::default());
+        let june_noon = time::local_midnight(2024, 6, 1).unwrap() + 12 * 3600 * 10_000_000;
+        let add = |index: &mut Index, frn, name: &str, size, mtime, attributes| {
+            index
+                .upsert(&NewEntry {
+                    size,
+                    mtime,
+                    ..entry(frn, 5, name, attributes)
+                })
+                .unwrap();
+        };
+        add(&mut index, 10, "tiny.txt", 10, june_noon, 0);
+        add(&mut index, 11, "big.iso", 3 << 30, june_noon + time::DAY, 0);
+        add(&mut index, 12, "empty.log", 0, time::now(), 0);
+        add(&mut index, 13, "folder", 0, time::now(), DIR);
+        add(&mut index, 14, "no-time.bin", 5, 0, 0);
+        let names = |q: &str| {
+            let query = Query::parse(q, FoldOptions::default()).unwrap();
+            let mut names: Vec<String> = search(&index, &query, 100)
+                .slots
+                .into_iter()
+                .map(|s| index.name(s).to_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("size:>1gb"), ["big.iso"]);
+        assert_eq!(names("size:empty"), ["empty.log"]);
+        assert_eq!(names("size:<1kb"), ["empty.log", "no-time.bin", "tiny.txt"]);
+        assert_eq!(names("dm:2024-06-01"), ["tiny.txt"]);
+        assert_eq!(names("dm:2024-06-01..2024-06-02"), ["big.iso", "tiny.txt"]);
+        assert_eq!(names("dm:>2024-06-01 size:>0"), ["big.iso"]);
+        assert_eq!(names("dm:today"), ["empty.log", "folder"]);
+        assert_eq!(names("dm:<2024-06-02"), ["tiny.txt"]);
     }
 
     #[test]
