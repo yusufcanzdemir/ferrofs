@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local-only project notes (not published)
+CLAUDE.md
+/docs/
+/.claude/
+
+# Editor / OS
+/.vscode/
+*.code-workspace
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+*.vhd
+*.vhdx
