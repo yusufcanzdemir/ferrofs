@@ -12,10 +12,11 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 
-use crate::hook::HotkeyAction;
-use crate::link::{self, Modes};
+use crate::config::{self, Config};
+use crate::hook::{self, HotkeyAction};
+use crate::link::{self, LinkMode, Modes, Options};
 use crate::selection::{self, ExplorerView};
-use crate::tray::{Level, Notifier};
+use crate::tray::{Level, LinkChoice, TrayHandle};
 
 /// Messages sent to the worker.
 #[derive(Debug)]
@@ -25,33 +26,43 @@ pub enum Command {
         action: HotkeyAction,
         window: isize,
     },
+    /// Re-read the config file and apply it.
+    ReloadConfig,
     Shutdown,
 }
 
-pub fn spawn(rx: Receiver<Command>, notifier: Notifier) -> Result<JoinHandle<()>> {
+pub fn spawn(
+    rx: Receiver<Command>,
+    tray: TrayHandle,
+    config: Config,
+    config_path: PathBuf,
+) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("worker".into())
-        .spawn(move || run(&rx, notifier))
+        .spawn(move || run(&rx, tray, config, config_path))
         .context("cannot spawn worker thread")
 }
 
-fn run(rx: &Receiver<Command>, notifier: Notifier) {
+fn run(rx: &Receiver<Command>, tray: TrayHandle, config: Config, config_path: PathBuf) {
     let _com = match ComApartment::init() {
         Ok(com) => com,
         Err(err) => {
             tracing::error!("cannot initialise COM: {err:#}");
-            notifier.notify(Level::Error, "ferro-link", "Failed to initialise COM.");
+            tray.notify(Level::Error, "ferro-link", "Failed to initialise COM.");
             return;
         }
     };
 
     let mut worker = Worker {
-        notifier,
+        tray,
+        config,
+        config_path,
         picked: Vec::new(),
     };
     for command in rx {
         match command {
             Command::Shutdown => break,
+            Command::ReloadConfig => worker.reload_config(),
             Command::Hotkey { action, window } => {
                 let window = HWND(window as *mut c_void);
                 match action {
@@ -64,18 +75,46 @@ fn run(rx: &Receiver<Command>, notifier: Notifier) {
 }
 
 struct Worker {
-    notifier: Notifier,
+    tray: TrayHandle,
+    config: Config,
+    config_path: PathBuf,
     /// Items remembered by the last successful pick.
     picked: Vec<PathBuf>,
 }
 
 impl Worker {
+    fn reload_config(&mut self) {
+        match config::load_or_create(&self.config_path) {
+            Ok(config) => {
+                hook::set_hotkeys(config.hotkeys.pick, config.hotkeys.drop);
+                self.config = config;
+                tracing::info!(?config, "config reloaded");
+                self.tray.notify(
+                    Level::Info,
+                    "Config reloaded",
+                    &format!(
+                        "Pick: {}, drop: {}",
+                        config.hotkeys.pick, config.hotkeys.drop
+                    ),
+                );
+            }
+            Err(err) => {
+                tracing::error!("cannot reload config: {err:#}");
+                self.tray.notify(
+                    Level::Error,
+                    "Config not reloaded",
+                    &format!("{err:#}. The previous settings stay active."),
+                );
+            }
+        }
+    }
+
     fn pick(&mut self, window: HWND) {
         let view = match selection::read(window) {
             Ok(view) => view,
             Err(err) => {
                 tracing::error!("cannot read Explorer selection: {err:#}");
-                self.notifier
+                self.tray
                     .notify(Level::Error, "Pick failed", &format!("{err:#}"));
                 return;
             }
@@ -88,7 +127,7 @@ impl Worker {
             } else {
                 "Nothing is selected."
             };
-            self.notifier.notify(Level::Warning, "Nothing picked", body);
+            self.tray.notify(Level::Warning, "Nothing picked", body);
             return;
         }
 
@@ -103,15 +142,15 @@ impl Worker {
             ));
         }
         self.picked = view.selection;
-        self.notifier.notify(Level::Info, "Picked", &body);
+        self.tray.notify(Level::Info, "Picked", &body);
     }
 
     fn drop_links(&mut self, window: HWND, choose_mode: bool) {
         if self.picked.is_empty() {
-            self.notifier.notify(
+            self.tray.notify(
                 Level::Warning,
                 "Nothing to drop",
-                "Select items and press Ctrl+B first.",
+                &format!("Select items and press {} first.", self.config.hotkeys.pick),
             );
             return;
         }
@@ -121,7 +160,7 @@ impl Worker {
                 ..
             }) => folder,
             Ok(_) => {
-                self.notifier.notify(
+                self.tray.notify(
                     Level::Warning,
                     "Cannot drop here",
                     "This location is not a regular folder.",
@@ -130,23 +169,47 @@ impl Worker {
             }
             Err(err) => {
                 tracing::error!("cannot read Explorer folder: {err:#}");
-                self.notifier
+                self.tray
                     .notify(Level::Error, "Drop failed", &format!("{err:#}"));
                 return;
             }
         };
-        if choose_mode {
-            // TODO(link): Shift+Ctrl+G mode popup (SPEC §1.4); uses defaults for now.
-            tracing::info!("mode chooser not implemented yet; using default modes");
-        }
-        self.drop_into(&target, Modes::default());
+
+        let configured = self.config.link.modes();
+        let modes = if choose_mode {
+            let has_dirs = self.picked.iter().any(|p| p.is_dir());
+            let has_files = self.picked.iter().any(|p| !p.is_dir());
+            let label = format!("{} / {}", configured.file, configured.dir);
+            match self.tray.choose_link_type(label, has_files, has_dirs) {
+                Some(LinkChoice::Configured) => configured,
+                Some(LinkChoice::Symlinks) => Modes {
+                    file: LinkMode::Symlink,
+                    dir: LinkMode::Symlink,
+                },
+                Some(LinkChoice::HardlinksAndJunctions) => Modes {
+                    file: LinkMode::Hardlink,
+                    dir: LinkMode::Junction,
+                },
+                None => {
+                    tracing::info!("link type menu dismissed");
+                    return;
+                }
+            }
+        } else {
+            configured
+        };
+        let options = Options {
+            modes,
+            relative_symlinks: self.config.link.relative_symlinks,
+        };
+        self.drop_into(&target, options);
     }
 
-    fn drop_into(&self, target: &Path, modes: Modes) {
+    fn drop_into(&self, target: &Path, options: Options) {
         let mut created = Vec::new();
         let mut failures = Vec::new();
         for source in &self.picked {
-            match link::link_into(source, target, modes) {
+            match link::link_into(source, target, options) {
                 Ok(link) => {
                     tracing::info!(source = %source.display(), link = %link.link.display(), mode = %link.mode, "link created");
                     created.push(link);
@@ -160,12 +223,12 @@ impl Worker {
 
         let folder = display_name(target);
         match (created.as_slice(), failures.as_slice()) {
-            ([one], []) => self.notifier.notify(
+            ([one], []) => self.tray.notify(
                 Level::Info,
                 "Linked",
                 &format!("{} ({}) in {folder}", display_name(&one.link), one.mode),
             ),
-            (many, []) => self.notifier.notify(
+            (many, []) => self.tray.notify(
                 Level::Info,
                 "Linked",
                 &format!("{} items in {folder}", many.len()),
@@ -188,7 +251,7 @@ impl Worker {
                 } else {
                     Level::Warning
                 };
-                self.notifier.notify(level, title, &body);
+                self.tray.notify(level, title, &body);
             }
         }
     }

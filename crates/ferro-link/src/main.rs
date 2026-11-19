@@ -1,13 +1,17 @@
 //! Tray app that creates symlinks, junctions and hard links via hotkeys.
 //!
 //! Threads:
-//! - main: hidden window + tray icon + message loop,
+//! - main: hidden window + tray icon + menus + message loop,
 //! - `keyboard-hook`: low-level keyboard hook with its own message loop,
 //! - `worker`: COM (STA) work triggered by hotkeys.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
+mod config;
 mod hook;
+mod hotkey;
+mod icon;
 mod link;
 mod logging;
 mod paths;
@@ -21,6 +25,9 @@ use std::sync::mpsc;
 
 use anyhow::Result;
 
+use crate::config::Config;
+use crate::tray::Level;
+
 fn main() -> Result<()> {
     let _log_guard = logging::init()?;
 
@@ -29,11 +36,29 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    let config_path = paths::config_file()?;
+    let (config, config_error) = match config::load_or_create(&config_path) {
+        Ok(config) => (config, None),
+        Err(err) => (Config::default(), Some(err)),
+    };
+    hook::set_hotkeys(config.hotkeys.pick, config.hotkeys.drop);
+
     let tray = tray::Tray::new()?;
+    let handle = tray.handle();
+    if let Some(err) = config_error {
+        tracing::error!("invalid config, using defaults: {err:#}");
+        handle.notify(
+            Level::Warning,
+            "Invalid config",
+            &format!("{err:#}. Using default settings."),
+        );
+    }
+
     let (tx, rx) = mpsc::channel();
-    let worker = worker::spawn(rx, tray.notifier())?;
+    tray.connect_worker(tx.clone());
+    let worker = worker::spawn(rx, handle, config, config_path)?;
     let hook = hook::spawn(tx.clone())?;
-    tracing::info!("ferro-link started");
+    tracing::info!(?config, "ferro-link started");
 
     let result = tray.run();
 

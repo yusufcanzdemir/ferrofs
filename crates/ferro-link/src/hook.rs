@@ -25,22 +25,29 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::Owned;
 
+use crate::hotkey::{ALT, CTRL, Hotkey, SHIFT, WIN};
 use crate::wide::{window_class, window_class_is};
 use crate::worker::Command;
 
 /// What a recognised hotkey asks the worker to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
-    /// Ctrl+B: remember the current Explorer selection.
+    /// Pick hotkey (Ctrl+B): remember the current Explorer selection.
     Pick,
-    /// Ctrl+G: create links in the current Explorer folder.
-    /// `choose_mode` is set when Shift is held (opens the mode popup).
+    /// Drop hotkey (Ctrl+G): create links in the current Explorer folder.
+    /// `choose_mode` is set when Shift is added to the drop hotkey (opens the mode popup).
     Drop { choose_mode: bool },
 }
 
-// TODO(config): make these configurable (SPEC §1.5).
-const PICK_VK: u32 = b'B' as u32;
-const DROP_VK: u32 = b'G' as u32;
+/// Packed [`Hotkey`]s, read lock-free by the hook callback; updated on config reload.
+static PICK: AtomicU32 = AtomicU32::new(0);
+static DROP: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the active hotkeys. May be called from any thread at any time.
+pub fn set_hotkeys(pick: Hotkey, drop: Hotkey) {
+    PICK.store(pick.pack(), Ordering::Relaxed);
+    DROP.store(drop.pack(), Ordering::Relaxed);
+}
 
 /// Top-level windows where the hotkeys are active: Explorer and the desktop.
 const EXPLORER_CLASSES: &[&str] = &["CabinetWClass", DESKTOP_CLASSES[0], DESKTOP_CLASSES[1]];
@@ -192,19 +199,40 @@ fn handle_key(message: u32, vk: u32) -> bool {
 }
 
 fn match_hotkey(vk: u32) -> Option<HotkeyAction> {
-    if vk != PICK_VK && vk != DROP_VK {
+    let pick = Hotkey::unpack(PICK.load(Ordering::Relaxed));
+    let drop = Hotkey::unpack(DROP.load(Ordering::Relaxed));
+    if vk != u32::from(pick.vk) && vk != u32::from(drop.vk) {
         return None; // cheap early exit for every other key
     }
-    // Ctrl+Alt is AltGr on many layouts (e.g. Turkish), so Alt must be up.
-    if !is_down(VK_CONTROL) || is_down(VK_MENU) || is_down(VK_LWIN) || is_down(VK_RWIN) {
+    // Exact modifier match, so Ctrl+Alt (AltGr on e.g. Turkish layouts) never matches Ctrl+B.
+    let mods = current_modifiers();
+    let action = if vk == u32::from(pick.vk) && mods == pick.mods {
+        HotkeyAction::Pick
+    } else if vk == u32::from(drop.vk) && mods == drop.mods {
+        HotkeyAction::Drop { choose_mode: false }
+    } else if vk == u32::from(drop.vk) && drop.mods & SHIFT == 0 && mods == drop.mods | SHIFT {
+        HotkeyAction::Drop { choose_mode: true }
+    } else {
         return None;
+    };
+    Some(action)
+}
+
+fn current_modifiers() -> u8 {
+    let mut mods = 0;
+    if is_down(VK_CONTROL) {
+        mods |= CTRL;
     }
-    let shift = is_down(VK_SHIFT);
-    match vk {
-        PICK_VK if !shift => Some(HotkeyAction::Pick),
-        DROP_VK => Some(HotkeyAction::Drop { choose_mode: shift }),
-        _ => None,
+    if is_down(VK_SHIFT) {
+        mods |= SHIFT;
     }
+    if is_down(VK_MENU) {
+        mods |= ALT;
+    }
+    if is_down(VK_LWIN) || is_down(VK_RWIN) {
+        mods |= WIN;
+    }
+    mods
 }
 
 fn is_down(key: VIRTUAL_KEY) -> bool {

@@ -25,13 +25,6 @@ pub enum LinkMode {
     /// Mount-point reparse point; folders only, no privilege needed, local volumes only.
     Junction,
     /// `CreateHardLinkW`; files only, same volume only.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "selectable via config and the Shift mode popup (next step)"
-        )
-    )]
     Hardlink,
 }
 
@@ -50,6 +43,14 @@ impl fmt::Display for LinkMode {
 pub struct Modes {
     pub file: LinkMode,
     pub dir: LinkMode,
+}
+
+/// Everything that controls how links are created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    pub modes: Modes,
+    /// Store symlink targets relative to the link's folder when both are on one drive.
+    pub relative_symlinks: bool,
 }
 
 impl Default for Modes {
@@ -117,7 +118,8 @@ pub struct Created {
 
 /// Creates a link to `source` inside `target_dir`. On a name collision the link is named
 /// `name (link).ext`, then `name (link 2).ext`, and so on.
-pub fn link_into(source: &Path, target_dir: &Path, modes: Modes) -> Result<Created, LinkError> {
+pub fn link_into(source: &Path, target_dir: &Path, options: Options) -> Result<Created, LinkError> {
+    let modes = options.modes;
     let metadata = std::fs::metadata(source).map_err(|err| match err.kind() {
         io::ErrorKind::NotFound => LinkError::SourceMissing,
         _ => LinkError::Io(err),
@@ -138,6 +140,11 @@ pub fn link_into(source: &Path, target_dir: &Path, modes: Modes) -> Result<Creat
         LinkMode::Junction => Some(local_drive_path(source).ok_or(LinkError::NotLocal)?),
         _ => None,
     };
+    let symlink_target = if mode == LinkMode::Symlink && options.relative_symlinks {
+        relative_path(target_dir, source).unwrap_or_else(|| source.to_owned())
+    } else {
+        source.to_owned()
+    };
 
     let name = source
         .file_name()
@@ -145,8 +152,10 @@ pub fn link_into(source: &Path, target_dir: &Path, modes: Modes) -> Result<Creat
     for attempt in 0..1000 {
         let link = target_dir.join(candidate_name(name, is_dir, attempt));
         let result = match (mode, &junction_target) {
-            (LinkMode::Symlink, _) if is_dir => std::os::windows::fs::symlink_dir(source, &link),
-            (LinkMode::Symlink, _) => std::os::windows::fs::symlink_file(source, &link),
+            (LinkMode::Symlink, _) if is_dir => {
+                std::os::windows::fs::symlink_dir(&symlink_target, &link)
+            }
+            (LinkMode::Symlink, _) => std::os::windows::fs::symlink_file(&symlink_target, &link),
             (LinkMode::Hardlink, _) => std::fs::hard_link(source, &link),
             (LinkMode::Junction, Some(target)) => create_junction(target, &link),
             (LinkMode::Junction, None) => unreachable_junction(),
@@ -199,6 +208,28 @@ fn starts_with_ignore_case(path: &Path, base: &Path) -> bool {
                 == b.as_os_str().to_string_lossy().to_lowercase()
         })
     })
+}
+
+/// Path of `to` relative to the folder `from_dir`, if both are on the same local drive.
+fn relative_path(from_dir: &Path, to: &Path) -> Option<PathBuf> {
+    let from = local_drive_path(from_dir)?;
+    let to = local_drive_path(to)?;
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let same = |a: &Component<'_>, b: &Component<'_>| {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
+    };
+    if !same(from.first()?, to.first()?) {
+        return None; // different drives
+    }
+    let common = from.iter().zip(&to).take_while(|(a, b)| same(a, b)).count();
+    let mut out = PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    out.extend(&to[common..]);
+    Some(out)
 }
 
 /// Returns `path` as `C:\...` if it is on a drive letter (plain or `\\?\C:\` form).
@@ -400,7 +431,7 @@ mod tests {
         let target = tmp.0.join("target");
         fs::create_dir(&target).unwrap();
 
-        let created = link_into(&source, &target, Modes::default()).unwrap();
+        let created = link_into(&source, &target, Options::default()).unwrap();
         assert_eq!(created.mode, LinkMode::Junction);
         assert_eq!(created.link, target.join("source"));
         assert_eq!(
@@ -418,9 +449,12 @@ mod tests {
     fn collisions_get_link_suffix() {
         let tmp = TempDir::new("collide");
         let source = file_in(&tmp.0, "a.txt", "1");
-        let modes = Modes {
-            file: LinkMode::Hardlink,
-            dir: LinkMode::Junction,
+        let modes = Options {
+            modes: Modes {
+                file: LinkMode::Hardlink,
+                dir: LinkMode::Junction,
+            },
+            relative_symlinks: false,
         };
         // Linking into the source's own folder collides with the original name.
         let first = link_into(&source, &tmp.0, modes).unwrap();
@@ -436,7 +470,7 @@ mod tests {
         let source = file_in(&tmp.0, "s.txt", "sym");
         let target = tmp.0.join("t");
         fs::create_dir(&target).unwrap();
-        match link_into(&source, &target, Modes::default()) {
+        match link_into(&source, &target, Options::default()) {
             Ok(created) => {
                 assert_eq!(created.mode, LinkMode::Symlink);
                 assert!(
@@ -459,21 +493,67 @@ mod tests {
         let dir = tmp.0.join("d");
         fs::create_dir_all(dir.join("sub")).unwrap();
         assert!(matches!(
-            link_into(&dir, &dir.join("sub"), Modes::default()),
+            link_into(&dir, &dir.join("sub"), Options::default()),
             Err(LinkError::IntoItself)
         ));
-        let hard_dirs = Modes {
-            file: LinkMode::Symlink,
-            dir: LinkMode::Hardlink,
+        let hard_dirs = Options {
+            modes: Modes {
+                file: LinkMode::Symlink,
+                dir: LinkMode::Hardlink,
+            },
+            relative_symlinks: false,
         };
         assert!(matches!(
             link_into(&dir, &tmp.0, hard_dirs),
             Err(LinkError::WrongKind(LinkMode::Hardlink))
         ));
         assert!(matches!(
-            link_into(&tmp.0.join("missing"), &tmp.0, Modes::default()),
+            link_into(&tmp.0.join("missing"), &tmp.0, Options::default()),
             Err(LinkError::SourceMissing)
         ));
+    }
+
+    #[test]
+    fn relative_path_cases() {
+        let rel = |a: &str, b: &str| relative_path(Path::new(a), Path::new(b));
+        assert_eq!(
+            rel(r"C:\a\b", r"C:\a\c\f.txt"),
+            Some(PathBuf::from(r"..\c\f.txt"))
+        );
+        assert_eq!(rel(r"C:\a", r"c:\A\f.txt"), Some(PathBuf::from("f.txt")));
+        assert_eq!(
+            rel(r"C:\x\y", r"C:\f.txt"),
+            Some(PathBuf::from(r"..\..\f.txt"))
+        );
+        assert_eq!(rel(r"C:\a", r"D:\f.txt"), None);
+    }
+
+    #[test]
+    fn relative_symlink_survives_moving_both() {
+        let tmp = TempDir::new("relative");
+        let project = tmp.0.join("project");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        let source = file_in(&project, "readme.txt", "rel");
+        let options = Options {
+            relative_symlinks: true,
+            ..Options::default()
+        };
+        let created = match link_into(&source, &project.join("docs"), options) {
+            Ok(created) => created,
+            Err(LinkError::PrivilegeNotHeld) => return, // no Developer Mode on this machine
+            Err(other) => panic!("unexpected error: {other}"),
+        };
+        assert_eq!(
+            fs::read_link(&created.link).unwrap(),
+            PathBuf::from(r"..\readme.txt")
+        );
+
+        let moved = tmp.0.join("moved");
+        fs::rename(&project, &moved).unwrap();
+        assert_eq!(
+            fs::read_to_string(moved.join(r"docs\readme.txt")).unwrap(),
+            "rel"
+        );
     }
 
     fn is_reparse_point(path: &Path) -> bool {
