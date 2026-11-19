@@ -12,6 +12,7 @@
 mod engine;
 mod logging;
 mod service;
+mod snapshots;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,7 +64,14 @@ pub fn run(server: &PipeServer) -> Result<()> {
         volumes = ?volumes.iter().map(|v| v.root.as_str()).collect::<Vec<_>>(),
         "starting"
     );
-    let engine = Engine::new(volumes, FoldOptions::default());
+    let snapshot_dir = match snapshots::prepare_dir() {
+        Ok(dir) => Some(dir),
+        Err(err) => {
+            tracing::warn!("index snapshots disabled: {err:#}");
+            None
+        }
+    };
+    let engine = Engine::new(volumes, FoldOptions::default(), snapshot_dir);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         for i in 0..engine.volume_count() {
@@ -140,7 +148,7 @@ fn query(text: &str) -> Result<()> {
     match client.request(&Request::Search(SearchRequest::new(text, 20)))? {
         Response::Search(result) => {
             for row in &result.rows {
-                println!("{}", row.path);
+                println!("{:>14} {}", row.size, row.path);
             }
             println!(
                 "-- {} matches in {:.2} ms{}",

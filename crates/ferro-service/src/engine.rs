@@ -5,9 +5,13 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use std::path::PathBuf;
+
+use ferro_core::metadata::{self, Metadata, MetadataReader};
+use ferro_core::snapshot::{self, Header};
 use ferro_core::usn::{self, JournalInfo, JournalReader, UsnRecord};
-use ferro_core::volume::VolumeInfo;
-use ferro_core::{FoldOptions, Index, Query, SearchOptions, SortBy, search_volumes};
+use ferro_core::volume::{self as core_volume, VolumeInfo};
+use ferro_core::{FoldOptions, Index, Query, SearchOptions, SortBy, scan_volume, search_volumes};
 use ferro_ipc::{
     ErrorCode, Request, Response, Row, SearchRequest, SearchResponse, Sort, Stats, VolumeState,
     VolumeStatus,
@@ -19,6 +23,8 @@ const MAX_ROWS: u32 = 10_000;
 const JOURNAL_WAIT: Duration = Duration::from_millis(500);
 /// Pause before retrying after a volume error.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Snapshots are rewritten at most this often while the index keeps changing.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 enum State {
     Scanning,
@@ -36,13 +42,16 @@ pub struct Engine {
     started: Instant,
     fold: FoldOptions,
     volumes: Vec<Volume>,
+    /// Folder for index snapshots; `None` disables them.
+    snapshot_dir: Option<PathBuf>,
 }
 
 impl Engine {
-    pub fn new(volumes: Vec<VolumeInfo>, fold: FoldOptions) -> Self {
+    pub fn new(volumes: Vec<VolumeInfo>, fold: FoldOptions, snapshot_dir: Option<PathBuf>) -> Self {
         Self {
             started: Instant::now(),
             fold,
+            snapshot_dir,
             volumes: volumes
                 .into_iter()
                 .map(|info| Volume {
@@ -62,8 +71,10 @@ impl Engine {
     pub fn run_volume(&self, i: usize, stop: &AtomicBool) {
         let volume = &self.volumes[i];
         let root = volume.info.root.as_str();
+        let mut try_snapshot = true;
         while !stop.load(Ordering::Relaxed) {
-            match self.scan_and_follow(volume, stop) {
+            let result = self.scan_and_follow(volume, stop, std::mem::take(&mut try_snapshot));
+            match result {
                 Ok(()) => return,
                 Err(err) => {
                     tracing::error!(root, "volume indexing failed: {err:#}");
@@ -76,15 +87,111 @@ impl Engine {
         }
     }
 
-    fn scan_and_follow(&self, volume: &Volume, stop: &AtomicBool) -> anyhow::Result<()> {
+    fn snapshot_path(&self, volume: &Volume) -> Option<PathBuf> {
+        // \\?\Volume{GUID}\ -> Volume{GUID}.bin
+        let guid: String = volume
+            .info
+            .guid_path
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '{' | '}' | '-'))
+            .collect();
+        Some(self.snapshot_dir.as_ref()?.join(format!("{guid}.bin")))
+    }
+
+    /// Loads the snapshot if it belongs to this volume and its journal position is still
+    /// available; otherwise `None` (a full scan follows).
+    fn load_snapshot(&self, volume: &Volume) -> Option<(Index, JournalInfo)> {
+        let path = self.snapshot_path(volume)?;
+        if !path.exists() {
+            return None;
+        }
+        let started = Instant::now();
+        let current = core_volume::Volume::open(&volume.info.root)
+            .and_then(|v| usn::query_journal(&v))
+            .ok()?;
+        let header = snapshot::read_header(&path)
+            .map_err(|err| tracing::warn!("ignoring snapshot: {err}"))
+            .ok()?;
+        if header.volume_guid != volume.info.guid_path
+            || header.journal_id != current.journal_id
+            || header.next_usn < current.first_usn
+            || header.next_usn > current.next_usn
+        {
+            tracing::info!(root = volume.info.root, "snapshot is stale; rescanning");
+            return None;
+        }
+        let (_, index) = snapshot::load(&path)
+            .map_err(|err| tracing::warn!("ignoring snapshot: {err}"))
+            .ok()?;
+        if index.fold_options() != self.fold {
+            return None;
+        }
+        tracing::info!(
+            root = volume.info.root,
+            entries = index.len(),
+            ms = started.elapsed().as_millis(),
+            "snapshot loaded"
+        );
+        Some((
+            index,
+            JournalInfo {
+                next_usn: header.next_usn,
+                ..current
+            },
+        ))
+    }
+
+    fn save_snapshot(&self, volume: &Volume, journal_id: u64) {
+        let Some(path) = self.snapshot_path(volume) else {
+            return;
+        };
+        let started = Instant::now();
+        let state = self.read_state(volume);
+        let State::Ready { index, next_usn } = &*state else {
+            return;
+        };
+        let header = Header {
+            format: snapshot::FORMAT,
+            volume_guid: volume.info.guid_path.clone(),
+            journal_id,
+            next_usn: *next_usn,
+        };
+        match snapshot::save(&path, &header, index) {
+            Ok(()) => tracing::info!(
+                root = volume.info.root,
+                ms = started.elapsed().as_millis(),
+                "snapshot saved"
+            ),
+            Err(err) => tracing::warn!(root = volume.info.root, "cannot save snapshot: {err}"),
+        }
+    }
+
+    fn scan_and_follow(
+        &self,
+        volume: &Volume,
+        stop: &AtomicBool,
+        try_snapshot: bool,
+    ) -> anyhow::Result<()> {
         let root = volume.info.root.as_str();
-        let (index, journal) = usn::scan(root, self.fold)?;
-        tracing::info!(root, entries = index.len(), "volume ready");
+        let (index, journal, from_snapshot) =
+            match try_snapshot.then(|| self.load_snapshot(volume)).flatten() {
+                Some((index, journal)) => (index, journal, true),
+                None => {
+                    let (index, journal) = scan_volume(root, self.fold)?;
+                    (index, journal, false)
+                }
+            };
+        tracing::info!(root, entries = index.len(), from_snapshot, "volume ready");
         *self.write_state(volume) = State::Ready {
             index: Box::new(index),
             next_usn: journal.next_usn,
         };
-        self.follow(volume, journal, stop)
+        if !from_snapshot {
+            self.save_snapshot(volume, journal.journal_id);
+        }
+        let result = self.follow(volume, journal, stop);
+        self.save_snapshot(volume, journal.journal_id);
+        result
     }
 
     fn follow(
@@ -94,17 +201,42 @@ impl Engine {
         stop: &AtomicBool,
     ) -> anyhow::Result<()> {
         let mut reader = JournalReader::open(&volume.info.root, journal)?;
+        let metadata = MetadataReader::open(&volume.info.root)
+            .map_err(|err| tracing::warn!("sizes will not be refreshed: {err}"))
+            .ok();
         let mut batch = RecordBatch::default();
+        let mut refreshed: Vec<(u64, Metadata)> = Vec::new();
+        let mut last_snapshot = Instant::now();
+        let mut dirty = false;
         while !stop.load(Ordering::Relaxed) {
+            if dirty && last_snapshot.elapsed() >= SNAPSHOT_INTERVAL {
+                self.save_snapshot(volume, journal.journal_id);
+                (dirty, last_snapshot) = (false, Instant::now());
+            }
             batch.clear();
             let count = reader.read(JOURNAL_WAIT, |record| batch.push(record))?;
             if count == 0 {
                 continue;
             }
+            // Read new sizes and times before taking the lock, so searches never wait on
+            // file system calls.
+            refreshed.clear();
+            if let Some(metadata) = &metadata {
+                refreshed.extend(
+                    batch
+                        .refresh_targets()
+                        .into_iter()
+                        .filter_map(|frn| Some((frn, metadata.query(frn)?))),
+                );
+            }
             let mut state = self.write_state(volume);
             if let State::Ready { index, next_usn } = &mut *state {
                 batch.apply(index);
+                for (frn, m) in &refreshed {
+                    index.set_metadata(*frn, m.size, m.alloc_size, m.mtime, m.attributes);
+                }
                 *next_usn = reader.next_usn();
+                dirty = true;
                 if index.needs_compaction() {
                     let started = Instant::now();
                     index.compact();
@@ -280,6 +412,19 @@ impl RecordBatch {
         ));
     }
 
+    /// Files whose size or time should be re-read after this batch.
+    fn refresh_targets(&self) -> Vec<u64> {
+        let mut frns: Vec<u64> = self
+            .records
+            .iter()
+            .filter(|r| metadata::needs_refresh(r.3))
+            .map(|r| r.0)
+            .collect();
+        frns.sort_unstable();
+        frns.dedup();
+        frns
+    }
+
     fn apply(&self, index: &mut Index) {
         for &(frn, parent_frn, usn, reason, attributes, start, len) in &self.records {
             let record = UsnRecord {
@@ -329,7 +474,11 @@ mod tests {
 
     /// Two volumes: C: ready, D: still scanning.
     fn engine() -> Engine {
-        let engine = Engine::new(vec![info(r"C:\"), info(r"D:\")], FoldOptions::default());
+        let engine = Engine::new(
+            vec![info(r"C:\"), info(r"D:\")],
+            FoldOptions::default(),
+            None,
+        );
         *engine.volumes[0].state.write().unwrap() = State::Ready {
             index: Box::new(index(
                 r"C:\",
@@ -355,7 +504,7 @@ mod tests {
     #[test]
     fn bad_query_and_limits() {
         let engine = engine();
-        let response = engine.handle(Request::Search(SearchRequest::new("size:>1mb", 10)));
+        let response = engine.handle(Request::Search(SearchRequest::new("dc:today", 10)));
         assert!(
             matches!(response, Response::Error { code: ErrorCode::BadQuery, message } if message.contains("not supported"))
         );
