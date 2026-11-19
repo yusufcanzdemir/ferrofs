@@ -1,7 +1,44 @@
 //! UTF-16 helpers for Win32 calls. All string conversions go through here.
 
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
+
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+use windows::core::PWSTR;
+
+/// A NUL-terminated UTF-16 string allocated by COM (`CoTaskMemAlloc`), freed on drop.
+#[derive(Debug)]
+pub struct CoTaskMemWide(PWSTR);
+
+impl CoTaskMemWide {
+    /// # Safety
+    /// `ptr` must be null or a NUL-terminated string allocated with `CoTaskMemAlloc`
+    /// that the caller owns.
+    pub unsafe fn new(ptr: PWSTR) -> Self {
+        Self(ptr)
+    }
+
+    pub fn to_path(&self) -> PathBuf {
+        if self.0.is_null() {
+            return PathBuf::new();
+        }
+        // SAFETY: non-null and NUL-terminated per the contract of `new`.
+        let units = unsafe { self.0.as_wide() };
+        PathBuf::from(OsString::from_wide(units))
+    }
+}
+
+impl Drop for CoTaskMemWide {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: allocated with CoTaskMemAlloc and owned by us (see `new`).
+            unsafe { CoTaskMemFree(Some(self.0.0.cast_const().cast())) };
+        }
+    }
+}
 
 /// Copies `s` into a fixed-size UTF-16 buffer, truncating if needed and
 /// always leaving a terminating NUL.

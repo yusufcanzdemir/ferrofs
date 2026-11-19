@@ -10,6 +10,7 @@
 mod hook;
 mod logging;
 mod paths;
+mod selection;
 mod single_instance;
 mod tray;
 mod wide;

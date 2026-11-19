@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -43,7 +43,9 @@ const PICK_VK: u32 = b'B' as u32;
 const DROP_VK: u32 = b'G' as u32;
 
 /// Top-level windows where the hotkeys are active: Explorer and the desktop.
-const EXPLORER_CLASSES: &[&str] = &["CabinetWClass", "Progman", "WorkerW"];
+const EXPLORER_CLASSES: &[&str] = &["CabinetWClass", DESKTOP_CLASSES[0], DESKTOP_CLASSES[1]];
+/// Top-level window classes of the desktop.
+pub const DESKTOP_CLASSES: [&str; 2] = ["Progman", "WorkerW"];
 /// Focused child windows that show the item view (Explorer list / desktop icons).
 /// Anything else (rename box, address bar, search box) lets the keys through.
 const ITEM_VIEW_CLASSES: &[&str] = &["DirectUIHWND", "SysListView32"];
@@ -167,12 +169,16 @@ fn handle_key(message: u32, vk: u32) -> bool {
             let Some(action) = match_hotkey(vk) else {
                 return false;
             };
-            if !explorer_item_view_has_focus() {
+            let Some(window) = focused_explorer_window() else {
                 return false;
-            }
+            };
             SWALLOWED_VK.store(vk, Ordering::Relaxed);
+            let command = Command::Hotkey {
+                action,
+                window: window.0 as isize,
+            };
             if let Some(sender) = SENDER.get()
-                && sender.send(Command::Hotkey(action)).is_err()
+                && sender.send(command).is_err()
             {
                 tracing::warn!("worker is gone; hotkey ignored");
             }
@@ -207,11 +213,12 @@ fn is_down(key: VIRTUAL_KEY) -> bool {
     state < 0
 }
 
-fn explorer_item_view_has_focus() -> bool {
+/// The foreground Explorer/desktop window, if its item view has keyboard focus.
+fn focused_explorer_window() -> Option<HWND> {
     // SAFETY: no preconditions.
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.is_invalid() || !window_class_is(foreground, EXPLORER_CLASSES) {
-        return false;
+        return None;
     }
 
     // SAFETY: `foreground` is a window handle; a stale handle just yields 0.
@@ -222,14 +229,14 @@ fn explorer_item_view_has_focus() -> bool {
     };
     // SAFETY: `gui` is a valid out-pointer with `cbSize` initialised.
     if unsafe { GetGUIThreadInfo(thread_id, &mut gui) }.is_err() || gui.hwndFocus.is_invalid() {
-        return false;
+        return None;
     }
     if window_class_is(gui.hwndFocus, ITEM_VIEW_CLASSES) {
-        return true;
+        return Some(foreground);
     }
     tracing::debug!(
         focus_class = %window_class(gui.hwndFocus),
         "hotkey ignored: focus is not on the item view"
     );
-    false
+    None
 }

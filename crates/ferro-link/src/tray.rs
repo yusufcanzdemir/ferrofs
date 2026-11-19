@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_STRING, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPED,
+    WM_CLOSE, WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPED,
 };
 use windows::core::{Owned, w};
 
@@ -133,7 +133,6 @@ impl Drop for Tray {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Info,
-    #[allow(dead_code, reason = "used for link failures in the next step")]
     Warning,
     Error,
 }
@@ -207,6 +206,13 @@ unsafe extern "system" fn window_proc(
         if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
             show_menu(hwnd);
         }
+        return LRESULT(0);
+    }
+    if msg == WM_CLOSE {
+        // Lets installers and scripts close the app gracefully.
+        tracing::info!("WM_CLOSE received");
+        // SAFETY: no preconditions; ends this thread's message loop.
+        unsafe { PostQuitMessage(0) };
         return LRESULT(0);
     }
     let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
