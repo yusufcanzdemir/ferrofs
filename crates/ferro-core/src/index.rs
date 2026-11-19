@@ -170,14 +170,37 @@ impl Index {
         let parent = u32::try_from(record_number(entry.parent_frn)).unwrap_or(NONE);
 
         let (name_off, name_len) = append_name(&mut self.name_pool, entry.name)?;
+        let flags = flags::from_attributes(entry.attributes);
+        let record_slot = record as usize;
+
+        // Same name and parent (e.g. a USN "data changed" record): update metadata only,
+        // so frequent writes do not grow the pools.
+        if let Some(existing) = self
+            .frn_to_slot
+            .get(record_slot)
+            .copied()
+            .filter(|&s| s != NONE)
+        {
+            let s = existing as usize;
+            let (old_pool, new_name) = self.name_pool.split_at(name_off as usize);
+            let old_name = &old_pool[self.name_off[s] as usize..][..usize::from(self.name_len[s])];
+            if self.parent[s] == parent && old_name == new_name {
+                self.name_pool.truncate(name_off as usize);
+                self.frn[s] = entry.frn;
+                self.size[s] = entry.size;
+                self.alloc_size[s] = entry.alloc_size;
+                self.mtime[s] = entry.mtime;
+                self.flags[s] = flags;
+                return Some(existing);
+            }
+        }
+
         let name_bytes = &self.name_pool[name_off as usize..][..usize::from(name_len)];
         let name = std::str::from_utf8(name_bytes).unwrap_or_default();
         let fold_off = u32::try_from(self.fold_pool.len()).ok()?;
         fold_into(name, self.fold_options, &mut self.fold_pool);
         let fold_len = u16::try_from(self.fold_pool.len() - fold_off as usize).ok()?;
-        let flags = flags::from_attributes(entry.attributes);
 
-        let record_slot = record as usize;
         if record_slot >= self.frn_to_slot.len() {
             self.frn_to_slot.resize(record_slot + 1, NONE);
         }
@@ -495,6 +518,19 @@ pub(crate) mod tests {
         let slot = index.upsert(&entry(50, 22, "new.txt", 0)).unwrap();
         assert_eq!(index.path(slot), r"C:\Users\me\Docs\new.txt");
         assert_eq!(index.len(), 6);
+    }
+
+    #[test]
+    fn unchanged_upsert_does_not_grow_pools() {
+        let mut index = sample();
+        let before = index.heap_bytes();
+        let pool_len = index.name_pool.len();
+        for _ in 0..1000 {
+            index.upsert(&entry(31, 22, "notes.txt", 0x20)).unwrap();
+        }
+        assert_eq!(index.name_pool.len(), pool_len);
+        assert_eq!(index.heap_bytes(), before);
+        assert!(!index.needs_compaction());
     }
 
     #[test]

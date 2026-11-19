@@ -214,6 +214,7 @@ dependencies = [
  "rayon",
  "thiserror",
  "tracing",
+ "windows",
 ]
 
 [[package]]
