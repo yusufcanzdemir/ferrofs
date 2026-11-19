@@ -8,7 +8,7 @@
 use memchr::memmem::Finder;
 use rayon::prelude::*;
 
-use crate::fold::{FoldOptions, fold};
+use crate::fold::{FoldOptions, fold, fold_into};
 use crate::index::Index;
 
 /// Why a query could not be parsed.
@@ -16,6 +16,11 @@ use crate::index::Index;
 pub enum QueryError {
     #[error("unknown filter `{0}:`")]
     UnknownFilter(String),
+    /// Recognised filter that needs data the index does not have yet (sizes, dates).
+    #[error("the `{0}:` filter is not supported yet")]
+    NotSupportedYet(String),
+    #[error("invalid regular expression: {0}")]
+    InvalidRegex(String),
     #[error("`{0}:` needs a value")]
     MissingValue(String),
     #[error("invalid value `{value}` for `{filter}:`")]
@@ -55,6 +60,8 @@ enum Term {
         dir: bool,
     },
     Path(Box<Finder<'static>>),
+    /// Matched against the folded name; compiled once and shared by all workers.
+    Regex(Box<regex::bytes::Regex>),
 }
 
 impl Term {
@@ -83,6 +90,14 @@ enum Token {
         quoted: bool,
     },
     Or,
+}
+
+fn is_regex_word(text: &str) -> bool {
+    let text = text.trim_start_matches('!').as_bytes();
+    let starts = |prefix: &[u8]| {
+        text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    starts(b"re:") || starts(b"regex:")
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -115,6 +130,8 @@ fn tokenize(input: &str) -> Vec<Token> {
             }
             c if in_quotes => word.text.push(c),
             c if c.is_whitespace() => flush(&mut tokens, &mut word),
+            // Inside `re:` the `|` belongs to the regex (alternation), not the query.
+            '|' if is_regex_word(&word.text) => word.text.push('|'),
             '|' => {
                 flush(&mut tokens, &mut word);
                 tokens.push(Token::Or);
@@ -202,6 +219,52 @@ impl Query {
     }
 }
 
+/// Folds the literal characters of a regex the same way names are folded, so the
+/// pattern matches the folded pool without `(?i)`. Escape sequences (`\D`, `\p{Lu}`,
+/// `\x{130}`) and group flags (`(?U)`, `(?P<name>`) are copied verbatim, because folding
+/// them would change their meaning.
+fn fold_regex_literals(pattern: &str, options: FoldOptions) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut folded = Vec::with_capacity(8);
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                let Some(next) = chars.next() else { break };
+                out.push(next);
+                if matches!(next, 'p' | 'P' | 'x' | 'u' | 'U') && chars.peek() == Some(&'{') {
+                    for c in chars.by_ref() {
+                        out.push(c);
+                        if c == '}' {
+                            break;
+                        }
+                    }
+                } else if matches!(next, 'p' | 'P')
+                    && let Some(class) = chars.next()
+                {
+                    out.push(class); // one-letter class such as \pL
+                }
+            }
+            '(' if chars.peek() == Some(&'?') => {
+                out.push(c);
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if matches!(c, ':' | ')' | '>') {
+                        break;
+                    }
+                }
+            }
+            c => {
+                folded.clear();
+                fold_into(c.encode_utf8(&mut [0; 4]), options, &mut folded);
+                out.push_str(std::str::from_utf8(&folded).unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
 fn is_boundary(byte: u8) -> bool {
     byte.is_ascii() && !byte.is_ascii_alphanumeric()
 }
@@ -245,6 +308,14 @@ fn parse_word(
                 _ => return Err(invalid()),
             },
             "path" => Term::Path(Box::new(Finder::new(&fold(value, options)).into_owned())),
+            "re" | "regex" => {
+                let pattern = fold_regex_literals(value, options);
+                let regex = regex::bytes::Regex::new(&pattern)
+                    .map_err(|e| QueryError::InvalidRegex(e.to_string()))?;
+                Term::Regex(Box::new(regex))
+            }
+            // Milestone 5 (raw MFT parser) provides sizes and timestamps.
+            "size" | "dm" | "dc" | "da" => return Err(QueryError::NotSupportedYet(filter)),
             _ => return Err(QueryError::UnknownFilter(filter)),
         };
         return Ok(Node::Leaf(term));
@@ -300,6 +371,7 @@ fn eval(node: &Node, index: &Index, slot: u32, scratch: &mut Scratch) -> bool {
                 let ext = &name[dot + 1..];
                 exts.iter().any(|e| e.as_slice() == ext)
             }
+            Term::Regex(regex) => regex.is_match(index.folded_name(slot)),
             Term::Path(finder) => {
                 if !scratch.path_ready {
                     index.folded_path_into(slot, &mut scratch.chain, &mut scratch.path);
@@ -482,8 +554,20 @@ mod tests {
         let parse = |q| Query::parse(q, FoldOptions::default()).map(|_| ());
         assert_eq!(
             parse("size:>1mb"),
-            Err(QueryError::UnknownFilter("size".into()))
+            Err(QueryError::NotSupportedYet("size".into()))
         );
+        assert_eq!(
+            parse("dm:today"),
+            Err(QueryError::NotSupportedYet("dm".into()))
+        );
+        assert_eq!(
+            parse("foo:bar"),
+            Err(QueryError::UnknownFilter("foo".into()))
+        );
+        assert!(matches!(
+            parse("re:(unclosed"),
+            Err(QueryError::InvalidRegex(_))
+        ));
         assert_eq!(parse("ext:"), Err(QueryError::MissingValue("ext".into())));
         assert!(matches!(
             parse("type:pdf"),
@@ -491,6 +575,34 @@ mod tests {
         ));
         assert_eq!(parse("a |"), Err(QueryError::DanglingOperator));
         assert_eq!(parse("!"), Err(QueryError::DanglingOperator));
+    }
+
+    #[test]
+    fn regex_filter() {
+        assert_eq!(names(r"re:^REPORT\.pdf$"), ["Report.PDF"]);
+        assert_eq!(names(r"re:\d{4}"), ["My Report 2024.docx"]);
+        assert_eq!(names(r"re:\D+-old"), ["report-old.pdf"]);
+        assert_eq!(names(r#"re:"^my report""#), ["My Report 2024.docx"]);
+        assert_eq!(
+            names(r"re:^(?:notes|docs)$|^NOTES\."),
+            ["Docs", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn regex_literals_are_folded_but_escapes_are_kept() {
+        let tr = FoldOptions { turkish_i: true };
+        let d = FoldOptions::default();
+        assert_eq!(fold_regex_literals(r"^ABC\D\W[A-Z]", d), r"^abc\D\W[a-z]");
+        assert_eq!(
+            fold_regex_literals(r"\p{Lu}\pL\x{130}İ", d),
+            r"\p{Lu}\pL\x{130}i"
+        );
+        assert_eq!(
+            fold_regex_literals(r"(?U)A+(?P<Name>B)", d),
+            r"(?U)a+(?P<Name>b)"
+        );
+        assert_eq!(fold_regex_literals("IŞIK", tr), "işik");
     }
 
     #[test]

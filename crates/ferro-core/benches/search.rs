@@ -120,6 +120,8 @@ fn benches(c: &mut Criterion) {
         "*.toml",
         "invoice|photo jpg",
         "path:report_1 main",
+        r"re:^report.*\.pdf$",
+        r"re:\d{4}\.(jpg|png)$",
         "zzzz-no-match",
     ] {
         let query = Query::parse(text, FoldOptions::default()).expect("valid query");
