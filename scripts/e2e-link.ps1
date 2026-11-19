@@ -1,6 +1,6 @@
 # End-to-end smoke test for ferro-link: simulates hotkeys in Explorer and Notepad,
 # then closes the app via WM_CLOSE. Opens windows on the desktop; run it manually:
-#   cargo build -p ferro-link; .scriptse2e-link.ps1 -Exe .	argetdebugerro-link.exe
+#   cargo build -p ferro-link; .\scripts\e2e-link.ps1 -Exe .\target\debug\ferro-link.exe
 param([string]$Exe)
 $ErrorActionPreference = 'Stop'
 Add-Type @'
