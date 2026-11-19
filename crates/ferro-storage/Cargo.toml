@@ -4,6 +4,7 @@ description = "Storage analyzer, duplicate finder, compression and cleanup tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 

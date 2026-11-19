@@ -4,6 +4,7 @@ description = "Named-pipe protocol shared by the ferrofs service and UIs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 

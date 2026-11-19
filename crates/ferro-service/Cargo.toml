@@ -4,6 +4,7 @@ description = "Windows service that owns the volume indexes and serves queries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
