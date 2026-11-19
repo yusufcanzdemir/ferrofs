@@ -20,7 +20,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ferro_core::FoldOptions;
 use ferro_core::volume::fixed_volumes;
-use ferro_ipc::{Client, PIPE_NAME, PipeServer, Request, Response, SearchRequest, StopSignal};
+use ferro_ipc::{
+    Client, PIPE_NAME, PipeServer, Request, Response, SearchRequest, ServerTrust, StopSignal,
+};
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::core::BOOL;
@@ -101,8 +103,14 @@ fn run_console() -> Result<()> {
 }
 
 fn connect() -> Result<Client> {
-    Client::connect(PIPE_NAME, "ferro-service-cli", Duration::from_secs(5))
-        .context("cannot reach the ferrofs service")
+    // Debug commands also work against `run --console`, which is not in session 0.
+    Client::connect(
+        PIPE_NAME,
+        "ferro-service-cli",
+        Duration::from_secs(5),
+        ServerTrust::Any,
+    )
+    .context("cannot reach the ferrofs service")
 }
 
 fn status() -> Result<()> {

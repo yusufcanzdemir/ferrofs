@@ -26,9 +26,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-    WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerSessionId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::{Owned, PCWSTR};
@@ -411,6 +411,16 @@ where
     Ok(())
 }
 
+/// Which pipe servers a client accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTrust {
+    /// Only a server running in session 0, i.e. a Windows service. Unelevated users cannot
+    /// start processes there, so a fake server squatting on the pipe name is refused.
+    ServiceSession,
+    /// Any server, e.g. `ferro-service run --console` while debugging, or tests.
+    Any,
+}
+
 /// The UI side of the pipe: a blocking connection to the service.
 #[derive(Debug)]
 pub struct Client {
@@ -421,14 +431,20 @@ pub struct Client {
 impl Client {
     /// Connects to `name` (normally [`PIPE_NAME`]) and performs the version handshake.
     /// Waits up to `timeout` while all pipe instances are busy.
-    pub fn connect(name: &str, client: &str, timeout: Duration) -> Result<Self, Error> {
-        Self::connect_with_protocol(name, client, timeout, PROTOCOL_VERSION)
+    pub fn connect(
+        name: &str,
+        client: &str,
+        timeout: Duration,
+        trust: ServerTrust,
+    ) -> Result<Self, Error> {
+        Self::connect_with_protocol(name, client, timeout, trust, PROTOCOL_VERSION)
     }
 
     fn connect_with_protocol(
         name: &str,
         client: &str,
         timeout: Duration,
+        trust: ServerTrust,
         protocol: u32,
     ) -> Result<Self, Error> {
         let name_w = wide_nul(name);
@@ -472,6 +488,22 @@ impl Client {
                 }
             }
         };
+
+        if trust == ServerTrust::ServiceSession {
+            let mut session = u32::MAX;
+            // SAFETY: `pipe` is a connected client handle and `session` a valid out-pointer.
+            unsafe { GetNamedPipeServerSessionId(*pipe.0, &mut session) }.map_err(|source| {
+                Error::Win32 {
+                    context: "cannot query the pipe server's session",
+                    source,
+                }
+            })?;
+            if session != 0 {
+                return Err(Error::UntrustedServer(format!(
+                    "the pipe server runs in session {session}, not as a Windows service"
+                )));
+            }
+        }
 
         let mut this = Self {
             pipe,
@@ -589,7 +621,7 @@ mod tests {
             // Wait until the first instance exists.
             let deadline = Instant::now() + Duration::from_secs(5);
             while matches!(
-                Client::connect(&name, "probe", Duration::from_millis(50)),
+                Client::connect(&name, "probe", Duration::from_millis(50), ServerTrust::Any),
                 Err(Error::NotRunning)
             ) {
                 assert!(Instant::now() < deadline, "server did not start");
@@ -604,7 +636,8 @@ mod tests {
     #[test]
     fn handshake_and_requests() {
         with_server(|name| {
-            let mut client = Client::connect(name, "test", Duration::from_secs(2)).unwrap();
+            let mut client =
+                Client::connect(name, "test", Duration::from_secs(2), ServerTrust::Any).unwrap();
             assert_eq!(client.service_version(), "9.9.9");
             for limit in [1, 50, 1000] {
                 let response = client
@@ -626,7 +659,8 @@ mod tests {
                 for i in 0..8u32 {
                     scope.spawn(move || {
                         let mut client =
-                            Client::connect(name, "test", Duration::from_secs(5)).unwrap();
+                            Client::connect(name, "test", Duration::from_secs(5), ServerTrust::Any)
+                                .unwrap();
                         for _ in 0..20 {
                             let response = client
                                 .request(&Request::Search(SearchRequest::new("x", i)))
@@ -645,7 +679,9 @@ mod tests {
     fn stops_while_a_client_is_idle() {
         let mut idle = None;
         with_server(|name| {
-            idle = Some(Client::connect(name, "idle", Duration::from_secs(2)).unwrap());
+            idle = Some(
+                Client::connect(name, "idle", Duration::from_secs(2), ServerTrust::Any).unwrap(),
+            );
         });
         // The server returned although `idle` never disconnected; it now sees a closed pipe.
         let mut idle = idle.unwrap();
@@ -659,6 +695,7 @@ mod tests {
                 name,
                 "old",
                 Duration::from_secs(2),
+                ServerTrust::Any,
                 PROTOCOL_VERSION + 1,
             );
             assert!(matches!(result, Err(Error::ProtocolMismatch(m)) if m.contains("protocol")));
@@ -666,8 +703,27 @@ mod tests {
     }
 
     #[test]
+    fn refuses_server_outside_session_zero() {
+        with_server(|name| {
+            // Tests run in the interactive session, so this server is not a service.
+            let result = Client::connect(
+                name,
+                "test",
+                Duration::from_secs(2),
+                ServerTrust::ServiceSession,
+            );
+            assert!(matches!(result, Err(Error::UntrustedServer(_))));
+        });
+    }
+
+    #[test]
     fn reports_not_running() {
-        let result = Client::connect(&unique_name(), "test", Duration::from_millis(100));
+        let result = Client::connect(
+            &unique_name(),
+            "test",
+            Duration::from_millis(100),
+            ServerTrust::Any,
+        );
         assert!(matches!(result, Err(Error::NotRunning)));
     }
 

@@ -8,7 +8,7 @@ pub mod frame;
 pub mod pipe;
 pub mod protocol;
 
-pub use pipe::{Client, PIPE_NAME, PipeServer, StopSignal};
+pub use pipe::{Client, PIPE_NAME, PipeServer, ServerTrust, StopSignal};
 pub use protocol::*;
 
 /// Errors from the pipe transport and the protocol.
@@ -18,6 +18,9 @@ pub enum Error {
     NotRunning,
     #[error("timed out waiting for the ferrofs service")]
     Timeout,
+    /// The pipe is served by a process we do not trust (see `ServerTrust`).
+    #[error("refusing to talk to the pipe server: {0}")]
+    UntrustedServer(String),
     #[error("protocol mismatch: {0}")]
     ProtocolMismatch(String),
     #[error("message of {0} bytes exceeds the frame limit")]
