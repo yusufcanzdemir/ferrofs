@@ -1,0 +1,514 @@
+//! Query parsing and parallel execution (SPEC §2.6).
+//!
+//! Syntax: terms separated by spaces are ANDed, `|` separates alternatives (binds tighter
+//! than AND), `!` negates a term, `"…"` quotes spaces. Filters: `ext:pdf;docx`,
+//! `type:file|folder`, `path:text` (matched against the full path, evaluated last).
+//! Terms containing `*` or `?` are wildcards matched against the whole name.
+
+use memchr::memmem::Finder;
+use rayon::prelude::*;
+
+use crate::fold::{FoldOptions, fold};
+use crate::index::Index;
+
+/// Why a query could not be parsed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QueryError {
+    #[error("unknown filter `{0}:`")]
+    UnknownFilter(String),
+    #[error("`{0}:` needs a value")]
+    MissingValue(String),
+    #[error("invalid value `{value}` for `{filter}:`")]
+    InvalidValue { filter: String, value: String },
+    #[error("`|` or `!` without a term")]
+    DanglingOperator,
+}
+
+/// A parsed, ready-to-run query. Cheap to share between threads.
+#[derive(Debug, Clone)]
+pub struct Query {
+    root: Node,
+    /// First plain positive term, used for ranking.
+    primary: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+enum Node {
+    And(Vec<Node>),
+    Or(Vec<Node>),
+    Not(Box<Node>),
+    Leaf(Term),
+}
+
+#[derive(Debug, Clone)]
+enum Term {
+    // Boxed: a Finder is large and would bloat every node.
+    Substring(Box<Finder<'static>>),
+    /// Whole-name pattern plus its longest literal run, used as a fast prefilter.
+    Wildcard {
+        pattern: Vec<u8>,
+        literal: Option<Box<Finder<'static>>>,
+    },
+    /// Folded extensions without the dot.
+    Ext(Vec<Vec<u8>>),
+    Type {
+        dir: bool,
+    },
+    Path(Box<Finder<'static>>),
+}
+
+impl Term {
+    /// Path terms rebuild the full path, so they run after everything else.
+    fn is_expensive(&self) -> bool {
+        matches!(self, Self::Path(_))
+    }
+}
+
+impl Node {
+    fn is_expensive(&self) -> bool {
+        match self {
+            Self::Leaf(term) => term.is_expensive(),
+            Self::Not(inner) => inner.is_expensive(),
+            Self::And(nodes) | Self::Or(nodes) => nodes.iter().any(Self::is_expensive),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Token {
+    Word {
+        text: String,
+        /// Byte offset of the first `:` outside quotes.
+        colon: Option<usize>,
+        quoted: bool,
+    },
+    Or,
+}
+
+fn tokenize(input: &str) -> Vec<Token> {
+    #[derive(Default)]
+    struct Word {
+        text: String,
+        colon: Option<usize>,
+        quoted: bool,
+    }
+
+    fn flush(tokens: &mut Vec<Token>, word: &mut Word) {
+        let word = std::mem::take(word);
+        if !word.text.is_empty() || word.quoted {
+            tokens.push(Token::Word {
+                text: word.text,
+                colon: word.colon,
+                quoted: word.quoted,
+            });
+        }
+    }
+
+    let mut tokens = Vec::new();
+    let mut word = Word::default();
+    let mut in_quotes = false;
+    for c in input.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                word.quoted = true;
+            }
+            c if in_quotes => word.text.push(c),
+            c if c.is_whitespace() => flush(&mut tokens, &mut word),
+            '|' => {
+                flush(&mut tokens, &mut word);
+                tokens.push(Token::Or);
+            }
+            ':' if word.colon.is_none() => {
+                word.colon = Some(word.text.len());
+                word.text.push(':');
+            }
+            c => word.text.push(c),
+        }
+    }
+    flush(&mut tokens, &mut word);
+    tokens
+}
+
+impl Query {
+    /// Parses `input`; names must be folded with the same `options` as the index.
+    pub fn parse(input: &str, options: FoldOptions) -> Result<Self, QueryError> {
+        let tokens = tokenize(input);
+        let mut and = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            // One OR-group: unit ('|' unit)*
+            let mut alternatives = Vec::new();
+            loop {
+                let Some(Token::Word {
+                    text,
+                    colon,
+                    quoted,
+                }) = tokens.get(i)
+                else {
+                    return Err(QueryError::DanglingOperator);
+                };
+                alternatives.push(parse_word(text, *colon, *quoted, options)?);
+                i += 1;
+                if tokens.get(i) == Some(&Token::Or) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            and.push(if alternatives.len() == 1 {
+                alternatives.remove(0)
+            } else {
+                Node::Or(alternatives)
+            });
+        }
+
+        let primary = and.iter().find_map(|node| match node {
+            Node::Leaf(Term::Substring(finder)) => Some(finder.needle().to_vec()),
+            _ => None,
+        });
+        // Cheap terms first; path terms only run for entries that passed the rest.
+        and.sort_by_key(Node::is_expensive);
+        Ok(Self {
+            root: Node::And(and),
+            primary,
+        })
+    }
+
+    /// True if the query has no terms (matches everything).
+    pub fn is_empty(&self) -> bool {
+        matches!(&self.root, Node::And(nodes) if nodes.is_empty())
+    }
+
+    fn matches(&self, index: &Index, slot: u32, scratch: &mut Scratch) -> bool {
+        scratch.path_ready = false;
+        eval(&self.root, index, slot, scratch)
+    }
+
+    /// Ranking key; smaller is better. Exact > prefix > word boundary > substring,
+    /// then shorter names, then slot order.
+    fn rank(&self, index: &Index, slot: u32) -> u64 {
+        let name = index.folded_name(slot);
+        let class: u64 = match &self.primary {
+            None => 4,
+            Some(term) if name == term.as_slice() => 0,
+            Some(term) => match memchr::memmem::find(name, term) {
+                Some(0) => 1,
+                Some(pos) if is_boundary(name[pos - 1]) => 2,
+                _ => 3,
+            },
+        };
+        (class << 48) | ((name.len().min(0xFFFF) as u64) << 32) | u64::from(slot)
+    }
+}
+
+fn is_boundary(byte: u8) -> bool {
+    byte.is_ascii() && !byte.is_ascii_alphanumeric()
+}
+
+fn parse_word(
+    text: &str,
+    colon: Option<usize>,
+    quoted: bool,
+    options: FoldOptions,
+) -> Result<Node, QueryError> {
+    if let Some(rest) = text.strip_prefix('!') {
+        if rest.is_empty() {
+            return Err(QueryError::DanglingOperator);
+        }
+        let inner = parse_word(rest, colon.map(|c| c - 1), quoted, options)?;
+        return Ok(Node::Not(Box::new(inner)));
+    }
+
+    if let Some(at) = colon {
+        let filter = text[..at].to_ascii_lowercase();
+        let value = &text[at + 1..];
+        if value.is_empty() {
+            return Err(QueryError::MissingValue(filter));
+        }
+        let invalid = || QueryError::InvalidValue {
+            filter: filter.clone(),
+            value: value.to_owned(),
+        };
+        let term = match filter.as_str() {
+            "ext" => Term::Ext(
+                value
+                    .split([';', ','])
+                    .map(|e| e.trim().trim_start_matches('.'))
+                    .filter(|e| !e.is_empty())
+                    .map(|e| fold(e, options))
+                    .collect(),
+            ),
+            "type" => match value.to_ascii_lowercase().as_str() {
+                "file" | "files" => Term::Type { dir: false },
+                "folder" | "folders" | "dir" | "dirs" | "directory" => Term::Type { dir: true },
+                _ => return Err(invalid()),
+            },
+            "path" => Term::Path(Box::new(Finder::new(&fold(value, options)).into_owned())),
+            _ => return Err(QueryError::UnknownFilter(filter)),
+        };
+        return Ok(Node::Leaf(term));
+    }
+
+    let folded = fold(text, options);
+    if !quoted && folded.iter().any(|&b| b == b'*' || b == b'?') {
+        let literal = folded
+            .split(|&b| b == b'*' || b == b'?')
+            .max_by_key(|run| run.len())
+            .filter(|run| run.len() >= 2)
+            .map(|run| Box::new(Finder::new(run).into_owned()));
+        return Ok(Node::Leaf(Term::Wildcard {
+            pattern: folded,
+            literal,
+        }));
+    }
+    Ok(Node::Leaf(Term::Substring(Box::new(
+        Finder::new(&folded).into_owned(),
+    ))))
+}
+
+/// Per-thread buffers reused across entries so evaluation does not allocate.
+#[derive(Default)]
+struct Scratch {
+    chain: Vec<u32>,
+    path: Vec<u8>,
+    /// `path` holds the folded path of the entry being evaluated.
+    path_ready: bool,
+}
+
+fn eval(node: &Node, index: &Index, slot: u32, scratch: &mut Scratch) -> bool {
+    match node {
+        Node::And(nodes) => nodes.iter().all(|n| eval(n, index, slot, scratch)),
+        Node::Or(nodes) => nodes.iter().any(|n| eval(n, index, slot, scratch)),
+        Node::Not(inner) => !eval(inner, index, slot, scratch),
+        Node::Leaf(term) => match term {
+            Term::Substring(finder) => finder.find(index.folded_name(slot)).is_some(),
+            Term::Wildcard { pattern, literal } => {
+                let name = index.folded_name(slot);
+                literal.as_ref().is_none_or(|f| f.find(name).is_some())
+                    && wildcard_match(pattern, name)
+            }
+            Term::Type { dir } => index.is_dir(slot) == *dir,
+            Term::Ext(exts) => {
+                if index.is_dir(slot) {
+                    return false;
+                }
+                let name = index.folded_name(slot);
+                let Some(dot) = memchr::memrchr(b'.', name) else {
+                    return false;
+                };
+                let ext = &name[dot + 1..];
+                exts.iter().any(|e| e.as_slice() == ext)
+            }
+            Term::Path(finder) => {
+                if !scratch.path_ready {
+                    index.folded_path_into(slot, &mut scratch.chain, &mut scratch.path);
+                    scratch.path_ready = true;
+                }
+                finder.find(&scratch.path).is_some()
+            }
+        },
+    }
+}
+
+/// `*` matches any run of bytes, `?` exactly one UTF-8 character; the whole name must match.
+fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(b'?') => {
+                p += 1;
+                n += utf8_len(name[n]);
+            }
+            Some(&c) if c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    p = sp + 1;
+                    let next = sn + utf8_len(name[sn]);
+                    star = Some((sp, next));
+                    n = next;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p.min(pattern.len())..].iter().all(|&c| c == b'*')
+}
+
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// Result of [`search`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchResult {
+    /// Number of matching entries.
+    pub total: usize,
+    /// Best `limit` matches, best first.
+    pub slots: Vec<u32>,
+}
+
+/// Slots per parallel work item.
+const CHUNK: usize = 1 << 15;
+
+/// Runs `query` over all live entries in parallel and returns the best `limit` matches.
+pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
+    let slots = index.slot_count();
+    let partials: Vec<(usize, Vec<u64>)> = (0..slots.div_ceil(CHUNK))
+        .into_par_iter()
+        .map(|chunk| {
+            let start = chunk * CHUNK;
+            let end = (start + CHUNK).min(slots);
+            let mut keys = Vec::new();
+            let mut scratch = Scratch::default();
+            for slot in start..end {
+                // Slot counts are bounded by u32 (see Index::alloc_slot).
+                #[allow(clippy::cast_possible_truncation)]
+                let slot = slot as u32;
+                if index.is_live(slot) && query.matches(index, slot, &mut scratch) {
+                    keys.push(query.rank(index, slot));
+                }
+            }
+            let total = keys.len();
+            keep_best(&mut keys, limit);
+            (total, keys)
+        })
+        .collect();
+
+    let total = partials.iter().map(|(t, _)| t).sum();
+    let mut keys: Vec<u64> = partials.into_iter().flat_map(|(_, k)| k).collect();
+    keep_best(&mut keys, limit);
+    keys.sort_unstable();
+    SearchResult {
+        total,
+        // The low 32 bits of a key are the slot.
+        #[allow(clippy::cast_possible_truncation)]
+        slots: keys.into_iter().map(|k| k as u32).collect(),
+    }
+}
+
+fn keep_best(keys: &mut Vec<u64>, limit: usize) {
+    if keys.len() > limit {
+        if limit > 0 {
+            keys.select_nth_unstable(limit - 1);
+        }
+        keys.truncate(limit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::tests::{DIR, entry, sample};
+
+    fn names(query: &str) -> Vec<String> {
+        let mut index = sample();
+        index
+            .upsert(&entry(60, 5, "My Report 2024.docx", 0))
+            .unwrap();
+        index.upsert(&entry(61, 5, "report", DIR)).unwrap();
+        index.upsert(&entry(62, 22, "IŞIK.png", 0)).unwrap();
+        let q = Query::parse(query, FoldOptions::default()).unwrap();
+        search(&index, &q, 100)
+            .slots
+            .into_iter()
+            .map(|s| index.name(s).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn substring_ranking() {
+        assert_eq!(
+            names("report"),
+            [
+                "report",
+                "Report.PDF",
+                "report-old.pdf",
+                "My Report 2024.docx"
+            ]
+        );
+    }
+
+    #[test]
+    fn and_or_not() {
+        assert_eq!(names("report pdf"), ["Report.PDF", "report-old.pdf"]);
+        assert_eq!(names("report !old pdf"), ["Report.PDF"]);
+        assert_eq!(names("notes|docx"), ["notes.txt", "My Report 2024.docx"]);
+        assert_eq!(names("notes | docx"), ["notes.txt", "My Report 2024.docx"]);
+    }
+
+    #[test]
+    fn filters() {
+        assert_eq!(names("ext:pdf"), ["Report.PDF", "report-old.pdf"]);
+        assert_eq!(names("ext:.txt;docx"), ["notes.txt", "My Report 2024.docx"]);
+        assert_eq!(names("report type:folder"), ["report"]);
+        assert_eq!(names("type:dir").len(), 4);
+        assert_eq!(names("path:docs pdf"), ["Report.PDF"]);
+        assert_eq!(
+            names("path:\"me\\docs\""),
+            ["Docs", "notes.txt", "IŞIK.png", "Report.PDF"]
+        );
+    }
+
+    #[test]
+    fn wildcards_and_quotes() {
+        assert_eq!(names("*.pdf"), ["Report.PDF", "report-old.pdf"]);
+        assert_eq!(names("r?port*"), ["report", "Report.PDF", "report-old.pdf"]);
+        assert_eq!(names("\"my report\""), ["My Report 2024.docx"]);
+        assert_eq!(names("ışık"), Vec::<String>::new()); // dotless i needs the Turkish option
+        assert_eq!(names("işik"), ["IŞIK.png"]);
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert_eq!(names("").len(), 9);
+    }
+
+    #[test]
+    fn parse_errors() {
+        let parse = |q| Query::parse(q, FoldOptions::default()).map(|_| ());
+        assert_eq!(
+            parse("size:>1mb"),
+            Err(QueryError::UnknownFilter("size".into()))
+        );
+        assert_eq!(parse("ext:"), Err(QueryError::MissingValue("ext".into())));
+        assert!(matches!(
+            parse("type:pdf"),
+            Err(QueryError::InvalidValue { .. })
+        ));
+        assert_eq!(parse("a |"), Err(QueryError::DanglingOperator));
+        assert_eq!(parse("!"), Err(QueryError::DanglingOperator));
+    }
+
+    #[test]
+    fn wildcard_matcher() {
+        assert!(wildcard_match(b"*", b""));
+        assert!(wildcard_match(b"a*c", b"abbbc"));
+        assert!(!wildcard_match(b"a*c", b"abbbd"));
+        assert!(wildcard_match("?ehir".as_bytes(), "şehir".as_bytes()));
+        assert!(wildcard_match(b"*.tar.*", b"x.tar.gz"));
+    }
+
+    #[test]
+    fn limit_and_total() {
+        let index = sample();
+        let q = Query::parse("", FoldOptions::default()).unwrap();
+        let result = search(&index, &q, 2);
+        assert_eq!(result.total, 6);
+        assert_eq!(result.slots.len(), 2);
+        assert!(search(&index, &q, 0).slots.is_empty());
+    }
+}
