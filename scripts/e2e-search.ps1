@@ -54,6 +54,8 @@ try {
   Check 'default hotkey replaced' (-not [U]::IsWindowVisible($h))
   $wsh.SendKeys('^%k'); Start-Sleep -Milliseconds 800
   Check 'configured hotkey shows' ([U]::IsWindowVisible($h) -and [U]::GetForegroundWindow() -eq $h)
+  # Never type into whatever else is in front (e.g. Esc or Ctrl+Enter in the editor).
+  if ([U]::GetForegroundWindow() -ne $h) { throw 'search window is not in the foreground; not sending keys' }
 
   $wsh.SendKeys($Query); Start-Sleep -Milliseconds 1200
   $wsh.SendKeys('^c'); Start-Sleep -Milliseconds 400

@@ -17,14 +17,14 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
 
 use crate::config::Hotkey;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextW, MSG, SW_HIDE,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WM_HOTKEY,
+    BringWindowToTop, EnumThreadWindows, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, MSG, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_HOTKEY,
 };
 use windows::core::BOOL;
 
@@ -70,12 +70,11 @@ impl WindowControl {
         }
         place_on_cursor_monitor(hwnd);
         // SAFETY: `hwnd` is our top-level window; showing it from another thread is allowed
-        // (the call is marshalled to the owning thread). The process that received the
-        // hotkey may take the foreground.
+        // (the call is marshalled to the owning thread).
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
         }
+        bring_to_foreground(hwnd);
         self.visible.store(true, Ordering::Relaxed);
         if let Some(ctx) = self.ctx.get() {
             ctx.request_repaint();
@@ -94,6 +93,35 @@ impl WindowControl {
     /// When the window was last shown, consumed by the first frame afterwards.
     pub fn take_shown_at(&self) -> Option<Instant> {
         self.shown_at.lock().ok().and_then(|mut t| t.take())
+    }
+}
+
+/// Makes `hwnd` the foreground window with keyboard focus.
+///
+/// Windows often refuses `SetForegroundWindow` while another app is in front, even right
+/// after our hotkey (the window then appears but typing still goes to the other app).
+/// Temporarily attaching to the foreground thread's input queue lifts that restriction.
+fn bring_to_foreground(hwnd: HWND) {
+    // SAFETY: plain window/thread calls on valid handles; the input attachment is undone
+    // before returning.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd {
+            return;
+        }
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let this_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != this_thread
+            && AttachThreadInput(this_thread, foreground_thread, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(this_thread, foreground_thread, false);
+        }
+        if GetForegroundWindow() != hwnd {
+            tracing::warn!("could not bring the search window to the foreground");
+        }
     }
 }
 
