@@ -424,6 +424,53 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
+/// Result order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortBy {
+    /// Exact > prefix > word boundary > substring, then shorter names.
+    #[default]
+    Relevance,
+    Name,
+    Size,
+    Modified,
+}
+
+/// Ordering and paging for [`search_volumes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub sort: SortBy,
+    pub descending: bool,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            sort: SortBy::Relevance,
+            descending: false,
+            offset: 0,
+            limit: 100,
+        }
+    }
+}
+
+/// One match: which index (position in the slice given to [`search_volumes`]) and slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    pub volume: usize,
+    pub slot: u32,
+}
+
+/// Result of [`search_volumes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumesResult {
+    /// Number of matching entries over all volumes.
+    pub total: usize,
+    /// The requested page, in order.
+    pub hits: Vec<Hit>,
+}
+
 /// Result of [`search`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchResult {
@@ -436,48 +483,105 @@ pub struct SearchResult {
 /// Slots per parallel work item.
 const CHUNK: usize = 1 << 15;
 
-/// Runs `query` over all live entries in parallel and returns the best `limit` matches.
+/// Runs `query` over one index and returns the best `limit` matches by relevance.
 pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
-    let slots = index.slot_count();
-    let partials: Vec<(usize, Vec<u64>)> = (0..slots.div_ceil(CHUNK))
+    let options = SearchOptions {
+        limit,
+        ..SearchOptions::default()
+    };
+    let result = search_volumes(&[index], query, &options);
+    SearchResult {
+        total: result.total,
+        slots: result.hits.into_iter().map(|hit| hit.slot).collect(),
+    }
+}
+
+/// Runs `query` over several volume indexes in parallel and returns one sorted page.
+pub fn search_volumes(indexes: &[&Index], query: &Query, options: &SearchOptions) -> VolumesResult {
+    let keep = options.offset.saturating_add(options.limit);
+    match options.sort {
+        SortBy::Relevance => collect(indexes, query, keep, options, |i, slot| {
+            query.rank(indexes[i], slot)
+        }),
+        SortBy::Name => collect(indexes, query, keep, options, |i, slot| {
+            indexes[i].folded_name(slot)
+        }),
+        SortBy::Size => collect(indexes, query, keep, options, |i, slot| {
+            indexes[i].size(slot)
+        }),
+        SortBy::Modified => collect(indexes, query, keep, options, |i, slot| {
+            indexes[i].mtime(slot)
+        }),
+    }
+}
+
+/// Matches as `(sort key, volume, slot)`.
+type Found<K> = Vec<(K, usize, u32)>;
+
+/// Matches every live slot, keeps the best `keep` per work item by `(key, volume, slot)`
+/// and returns the requested page. Ties are broken by volume and slot, so pages are stable.
+fn collect<K: Ord + Send>(
+    indexes: &[&Index],
+    query: &Query,
+    keep: usize,
+    options: &SearchOptions,
+    key: impl Fn(usize, u32) -> K + Sync,
+) -> VolumesResult {
+    let descending = options.descending;
+    let order = |a: &(K, usize, u32), b: &(K, usize, u32)| {
+        if descending { b.cmp(a) } else { a.cmp(b) }
+    };
+    let work: Vec<(usize, usize)> = indexes
+        .iter()
+        .enumerate()
+        .flat_map(|(volume, index)| {
+            (0..index.slot_count().div_ceil(CHUNK)).map(move |chunk| (volume, chunk))
+        })
+        .collect();
+
+    let partials: Vec<(usize, Found<K>)> = work
         .into_par_iter()
-        .map(|chunk| {
+        .map(|(volume, chunk)| {
+            let index = indexes[volume];
             let start = chunk * CHUNK;
-            let end = (start + CHUNK).min(slots);
-            let mut keys = Vec::new();
+            let end = (start + CHUNK).min(index.slot_count());
+            let mut found = Vec::new();
             let mut scratch = Scratch::default();
             for slot in start..end {
                 // Slot counts are bounded by u32 (see Index::alloc_slot).
                 #[allow(clippy::cast_possible_truncation)]
                 let slot = slot as u32;
                 if index.is_live(slot) && query.matches(index, slot, &mut scratch) {
-                    keys.push(query.rank(index, slot));
+                    found.push((key(volume, slot), volume, slot));
                 }
             }
-            let total = keys.len();
-            keep_best(&mut keys, limit);
-            (total, keys)
+            let total = found.len();
+            keep_best(&mut found, keep, order);
+            (total, found)
         })
         .collect();
 
     let total = partials.iter().map(|(t, _)| t).sum();
-    let mut keys: Vec<u64> = partials.into_iter().flat_map(|(_, k)| k).collect();
-    keep_best(&mut keys, limit);
-    keys.sort_unstable();
-    SearchResult {
+    let mut found: Found<K> = partials.into_iter().flat_map(|(_, f)| f).collect();
+    keep_best(&mut found, keep, order);
+    found.sort_unstable_by(order);
+    VolumesResult {
         total,
-        // The low 32 bits of a key are the slot.
-        #[allow(clippy::cast_possible_truncation)]
-        slots: keys.into_iter().map(|k| k as u32).collect(),
+        hits: found
+            .into_iter()
+            .skip(options.offset)
+            .take(options.limit)
+            .map(|(_, volume, slot)| Hit { volume, slot })
+            .collect(),
     }
 }
 
-fn keep_best(keys: &mut Vec<u64>, limit: usize) {
-    if keys.len() > limit {
-        if limit > 0 {
-            keys.select_nth_unstable(limit - 1);
+fn keep_best<T>(items: &mut Vec<T>, keep: usize, order: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    if items.len() > keep {
+        if keep > 0 {
+            items.select_nth_unstable_by(keep - 1, &order);
         }
-        keys.truncate(limit);
+        items.truncate(keep);
     }
 }
 
@@ -485,6 +589,7 @@ fn keep_best(keys: &mut Vec<u64>, limit: usize) {
 mod tests {
     use super::*;
     use crate::index::tests::{DIR, entry, sample};
+    use crate::index::{Index, NewEntry};
 
     fn names(query: &str) -> Vec<String> {
         let mut index = sample();
@@ -612,6 +717,58 @@ mod tests {
         assert!(!wildcard_match(b"a*c", b"abbbd"));
         assert!(wildcard_match("?ehir".as_bytes(), "şehir".as_bytes()));
         assert!(wildcard_match(b"*.tar.*", b"x.tar.gz"));
+    }
+
+    #[test]
+    fn multi_volume_sorting_and_paging() {
+        let c = sample();
+        let mut d = Index::new("D:\\", FoldOptions::default());
+        d.upsert(&NewEntry {
+            size: 900,
+            ..entry(10, 5, "report-big.pdf", 0)
+        })
+        .unwrap();
+        d.upsert(&NewEntry {
+            size: 5,
+            ..entry(11, 5, "a-report.txt", 0)
+        })
+        .unwrap();
+        let query = Query::parse("report", FoldOptions::default()).unwrap();
+        let run = |sort, descending, offset, limit| {
+            let options = SearchOptions {
+                sort,
+                descending,
+                offset,
+                limit,
+            };
+            let indexes = [&c, &d];
+            let result = search_volumes(&indexes, &query, &options);
+            let paths: Vec<String> = result
+                .hits
+                .iter()
+                .map(|h| indexes[h.volume].path(h.slot))
+                .collect();
+            (result.total, paths)
+        };
+
+        let (total, by_name) = run(SortBy::Name, false, 0, 10);
+        assert_eq!(total, 4);
+        assert_eq!(
+            by_name,
+            [
+                r"D:\a-report.txt",
+                r"D:\report-big.pdf",
+                r"C:\report-old.pdf",
+                r"C:\Users\me\Docs\Report.PDF"
+            ]
+        );
+        let (_, page) = run(SortBy::Name, false, 1, 2);
+        assert_eq!(page, by_name[1..3]);
+        let (_, by_size) = run(SortBy::Size, true, 0, 1);
+        assert_eq!(by_size, [r"D:\report-big.pdf"]);
+        let (_, relevance) = run(SortBy::Relevance, false, 0, 10);
+        assert_eq!(relevance[0], r"C:\Users\me\Docs\Report.PDF");
+        assert_eq!(run(SortBy::Name, false, 10, 10).1.len(), 0);
     }
 
     #[test]

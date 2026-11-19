@@ -10,4 +10,7 @@ pub mod volume;
 pub use error::{Error, Result};
 pub use fold::FoldOptions;
 pub use index::{Index, Name, NewEntry};
-pub use query::{Query, QueryError, SearchResult, search};
+pub use query::{
+    Hit, Query, QueryError, SearchOptions, SearchResult, SortBy, VolumesResult, search,
+    search_volumes,
+};
