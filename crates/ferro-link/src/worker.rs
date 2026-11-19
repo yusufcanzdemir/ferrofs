@@ -13,6 +13,7 @@ use windows::Win32::System::Com::{
 };
 
 use crate::hook::HotkeyAction;
+use crate::link::{self, Modes};
 use crate::selection::{self, ExplorerView};
 use crate::tray::{Level, Notifier};
 
@@ -134,17 +135,62 @@ impl Worker {
                 return;
             }
         };
-        tracing::info!(?target, choose_mode, items = self.picked.len(), "drop");
-        // TODO(link): create the links (next step).
-        self.notifier.notify(
-            Level::Info,
-            "Drop",
-            &format!(
-                "Would link {} item(s) into {}. Link creation is not implemented yet.",
-                self.picked.len(),
-                display_name(&target)
+        if choose_mode {
+            // TODO(link): Shift+Ctrl+G mode popup (SPEC §1.4); uses defaults for now.
+            tracing::info!("mode chooser not implemented yet; using default modes");
+        }
+        self.drop_into(&target, Modes::default());
+    }
+
+    fn drop_into(&self, target: &Path, modes: Modes) {
+        let mut created = Vec::new();
+        let mut failures = Vec::new();
+        for source in &self.picked {
+            match link::link_into(source, target, modes) {
+                Ok(link) => {
+                    tracing::info!(source = %source.display(), link = %link.link.display(), mode = %link.mode, "link created");
+                    created.push(link);
+                }
+                Err(err) => {
+                    tracing::warn!(source = %source.display(), target = %target.display(), "link failed: {err}");
+                    failures.push((source, err));
+                }
+            }
+        }
+
+        let folder = display_name(target);
+        match (created.as_slice(), failures.as_slice()) {
+            ([one], []) => self.notifier.notify(
+                Level::Info,
+                "Linked",
+                &format!("{} ({}) in {folder}", display_name(&one.link), one.mode),
             ),
-        );
+            (many, []) => self.notifier.notify(
+                Level::Info,
+                "Linked",
+                &format!("{} items in {folder}", many.len()),
+            ),
+            (done, [(source, err), rest @ ..]) => {
+                let title = if done.is_empty() {
+                    "Link failed"
+                } else {
+                    "Some links failed"
+                };
+                let mut body = format!("{}: {err}", display_name(source));
+                if !rest.is_empty() {
+                    body.push_str(&format!(" (+{} more failed)", rest.len()));
+                }
+                if !done.is_empty() {
+                    body.push_str(&format!(". {} linked.", done.len()));
+                }
+                let level = if done.is_empty() {
+                    Level::Error
+                } else {
+                    Level::Warning
+                };
+                self.notifier.notify(level, title, &body);
+            }
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! UTF-16 helpers for Win32 calls. All string conversions go through here.
 
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::HWND;
@@ -38,6 +38,11 @@ impl Drop for CoTaskMemWide {
             unsafe { CoTaskMemFree(Some(self.0.0.cast_const().cast())) };
         }
     }
+}
+
+/// NUL-terminated UTF-16 copy of `s` for passing to Win32 as `PCWSTR`.
+pub fn to_wide_nul(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// Copies `s` into a fixed-size UTF-16 buffer, truncating if needed and

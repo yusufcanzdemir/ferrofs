@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod hook;
+mod link;
 mod logging;
 mod paths;
 mod selection;
