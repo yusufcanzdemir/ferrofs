@@ -5,13 +5,15 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, Event, FontId, Key, Modifiers, Rect, RichText, ScrollArea, Sense,
-    TextEdit, vec2,
+    self, Align2, Color32, CursorIcon, Event, FontId, Key, Modifiers, Rect, RichText, ScrollArea,
+    Sense, TextEdit, TextureHandle, vec2,
 };
 use ferro_core::index::flags;
 use ferro_ipc::{Row, SearchRequest, Sort};
 
 use crate::format::{format_size, format_time};
+use crate::history::History;
+use crate::icons::IconCache;
 use crate::shell;
 use crate::window::WindowControl;
 use crate::worker::{Job, Outcome, ServiceState};
@@ -50,6 +52,8 @@ pub struct App {
     was_focused: bool,
     /// Hide the window that eframe shows after the first frame.
     hide_after_first_frame: bool,
+    icons: IconCache,
+    history: History,
 }
 
 impl App {
@@ -59,6 +63,7 @@ impl App {
         jobs: Sender<Job>,
         outcomes: Receiver<Outcome>,
         start_hidden: bool,
+        history: History,
     ) -> Self {
         Self {
             control,
@@ -84,6 +89,8 @@ impl App {
             focus_input: true,
             was_focused: false,
             hide_after_first_frame: start_hidden,
+            icons: IconCache::default(),
+            history,
         }
     }
 
@@ -145,6 +152,9 @@ impl App {
                         self.rows.extend(result.rows);
                     } else {
                         self.rows = result.rows;
+                        if self.sort == Sort::Relevance {
+                            self.history.boost(&mut self.rows);
+                        }
                         self.selected = 0;
                         self.pending_scroll = Some(0.0);
                     }
@@ -187,10 +197,12 @@ impl App {
         let result = match action {
             Action::Open => {
                 self.control.hide();
+                self.history.record(&path);
                 shell::open(&path)
             }
             Action::Reveal => {
                 self.control.hide();
+                self.history.record(&path);
                 shell::reveal(&path)
             }
             Action::CopyFile => shell::copy_file(self.hwnd, &path)
@@ -273,7 +285,7 @@ impl App {
                 }
                 ui.label(RichText::new(text).color(weak));
             } else {
-                ui.label(RichText::new("Enter open · Ctrl+Enter reveal · Ctrl+C copy path · Ctrl+Shift+C copy file · Esc hide").color(weak));
+                ui.label(RichText::new("Enter open · Ctrl+Enter reveal · Ctrl+C copy path · Ctrl+Shift+C copy file · click a folder to copy it · Esc hide").color(weak));
             }
         });
     }
@@ -332,7 +344,9 @@ impl App {
         }
         let mut open = false;
         let mut clicked = None;
+        let mut copy_folder = None;
         let mut near_end = false;
+        let ctx = ui.ctx().clone();
         let output = area.show_rows(ui, ROW_HEIGHT, self.rows.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             near_end = range.end + 50 >= self.rows.len();
@@ -340,16 +354,40 @@ impl App {
                 let row = &self.rows[i];
                 let (rect, response) =
                     ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-                paint_row(ui, rect, row, i == self.selected, response.hovered());
+                let on_folder = response
+                    .hover_pos()
+                    .is_some_and(|p| Column::Path.rect(rect).contains(p));
+                if on_folder {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+                let icon = self.icons.get(&ctx, &row.path, row.flags & flags::DIR != 0);
+                paint_row(
+                    ui,
+                    rect,
+                    row,
+                    i == self.selected,
+                    response.hovered(),
+                    on_folder,
+                    icon.as_ref(),
+                );
                 if response.clicked() {
                     clicked = Some(i);
+                    if on_folder {
+                        copy_folder = Some(i);
+                    }
                 }
-                if response.double_clicked() {
+                // A double click on the folder cell is two copies, not an open.
+                if response.double_clicked() && !on_folder {
                     clicked = Some(i);
                     open = true;
                 }
             }
         });
+        if let Some(i) = copy_folder {
+            let folder = parent_folder(&self.rows[i].path).to_owned();
+            ctx.copy_text(folder.clone());
+            self.message = Some(format!("Copied {folder}"));
+        }
         self.scroll_y = output.state.offset.y;
         self.viewport_height = output.inner_rect.height();
         if let Some(i) = clicked {
@@ -438,7 +476,26 @@ impl Column {
     }
 }
 
-fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, selected: bool, hovered: bool) {
+/// Folder that contains `path` (`C:\a\b.txt` -> `C:\a`, `C:\a` -> `C:\`).
+fn parent_folder(path: &str) -> &str {
+    match path.rsplit_once('\\') {
+        Some((folder, _)) if folder.ends_with(':') => &path[..=folder.len()],
+        Some((folder, _)) => folder,
+        None => path,
+    }
+}
+
+const ICON_SIZE: f32 = 16.0;
+
+fn paint_row(
+    ui: &egui::Ui,
+    rect: Rect,
+    row: &Row,
+    selected: bool,
+    hovered: bool,
+    folder_hovered: bool,
+    icon: Option<&TextureHandle>,
+) {
     let visuals = ui.visuals();
     if selected {
         ui.painter()
@@ -458,7 +515,8 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, selected: bool, hovered: bool
         visuals.weak_text_color()
     };
 
-    let (folder, name) = row.path.rsplit_once('\\').unwrap_or(("", &row.path));
+    let name = row.path.rsplit('\\').next().unwrap_or(&row.path);
+    let folder = parent_folder(&row.path);
     let is_dir = row.flags & flags::DIR != 0;
     let name = if is_dir {
         format!("{name}\\")
@@ -478,17 +536,37 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, selected: bool, hovered: bool
     ];
     let font = FontId::proportional(13.5);
     for (column, text, color) in cells {
-        let cell = column.rect(rect);
-        // Folders keep their informative tail ("…\srcpp"), other cells their start.
+        let mut cell = column.rect(rect);
+        if matches!(column, Column::Name) {
+            if let Some(icon) = icon {
+                let icon_rect = Rect::from_center_size(
+                    egui::pos2(cell.left() + ICON_SIZE / 2.0, cell.center().y),
+                    vec2(ICON_SIZE, ICON_SIZE),
+                );
+                ui.painter().image(
+                    icon.id(),
+                    icon_rect,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            cell.min.x += ICON_SIZE + 6.0;
+        }
+        // Folders keep their informative tail ("…\src\app"), other cells their start.
         let keep_end = matches!(column, Column::Path);
         let text = fit_text(ui, &text, &font, cell.width(), keep_end);
-        ui.painter().with_clip_rect(cell).text(
+        let drawn = ui.painter().with_clip_rect(cell).text(
             column.anchor(cell),
             column.align(),
             text,
             font.clone(),
             color,
         );
+        if keep_end && folder_hovered {
+            let y = drawn.bottom() - 1.0;
+            ui.painter()
+                .hline(drawn.x_range(), y, egui::Stroke::new(1.0_f32, color));
+        }
     }
 }
 
@@ -614,7 +692,14 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::group_digits;
+    use super::{group_digits, parent_folder};
+
+    #[test]
+    fn parent_folders() {
+        assert_eq!(parent_folder(r"C:\a\b.txt"), r"C:\a");
+        assert_eq!(parent_folder(r"C:\b.txt"), r"C:\");
+        assert_eq!(parent_folder(r"D:\x\y\"), r"D:\x\y");
+    }
 
     #[test]
     fn digit_grouping() {

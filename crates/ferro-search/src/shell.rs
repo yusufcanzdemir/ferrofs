@@ -105,3 +105,32 @@ pub fn copy_file(owner: Option<isize>, path: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    use super::*;
+
+    /// Overwrites the user's clipboard, so it only runs on request.
+    #[test]
+    #[ignore = "replaces the clipboard contents"]
+    fn copy_file_puts_a_readable_file_list_on_the_clipboard() {
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let path = path.to_str().unwrap();
+        copy_file(None, path).unwrap();
+        // SAFETY: standard clipboard read; the handle stays owned by the clipboard.
+        let files = unsafe {
+            OpenClipboard(None).unwrap();
+            let data = GetClipboardData(u32::from(CF_HDROP.0)).unwrap();
+            let drop = HDROP(data.0);
+            let count = DragQueryFileW(drop, u32::MAX, None);
+            let mut buf = [0u16; 1024];
+            let len = DragQueryFileW(drop, 0, Some(&mut buf));
+            let _ = CloseClipboard();
+            (count, String::from_utf16_lossy(&buf[..len as usize]))
+        };
+        assert_eq!(files, (1, path.to_owned()));
+    }
+}

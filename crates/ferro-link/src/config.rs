@@ -23,10 +23,16 @@ file_mode = "symlink"   # symlink | hardlink
 dir_mode  = "junction"  # junction | symlink
 # Symlinks store a path relative to the link's folder (survives moving both together).
 relative_symlinks = false
+
+[search]
+# Show or hide the ferro-search window.
+hotkey = "Ctrl+Alt+Space"
 "#;
 
+/// Unknown top-level sections are allowed: the file is shared with other ferrofs apps
+/// (e.g. `[search]` for ferro-search). Inside our own sections typos are still errors.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub hotkeys: Hotkeys,
     pub link: LinkConfig,
@@ -188,7 +194,9 @@ mod tests {
         assert!(Config::parse("[link]\nfile_mode = \"junction\"").is_err());
         assert!(Config::parse("[hotkeys]\npick = \"B\"").is_err());
         assert!(Config::parse("[hotkeys]\npick = \"Ctrl+G\"").is_err()); // same as drop
-        assert!(Config::parse("[unknown]\nx = 1").is_err());
+        assert!(Config::parse("[link]\nunknown = 1").is_err());
+        // Sections of other ferrofs apps are fine.
+        assert!(Config::parse("[search]\nhotkey = \"Win+S\"").is_ok());
     }
 
     #[test]

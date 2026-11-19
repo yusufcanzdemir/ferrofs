@@ -4,7 +4,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod config;
 mod format;
+mod history;
+mod icons;
 mod logging;
 mod shell;
 mod window;
@@ -70,7 +73,9 @@ fn main() -> Result<()> {
             } else {
                 tracing::error!("cannot find the search window handle");
             }
-            if let Err(err) = window::spawn_hotkey_thread(Arc::clone(&control)) {
+            let hotkey = config::load_hotkey();
+            let label = format!("{hotkey:?}");
+            if let Err(err) = window::spawn_hotkey_thread(Arc::clone(&control), hotkey, label) {
                 tracing::error!("{err:#}");
             }
             let (jobs, outcomes) = worker::spawn(cc.egui_ctx.clone())?;
@@ -78,8 +83,9 @@ fn main() -> Result<()> {
             if show_now {
                 control.show();
             }
+            let history = history::History::load(history::History::default_file());
             Ok(Box::new(app::App::new(
-                control, hwnd, jobs, outcomes, !show_now,
+                control, hwnd, jobs, outcomes, !show_now, history,
             )))
         }),
     )

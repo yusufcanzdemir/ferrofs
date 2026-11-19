@@ -18,9 +18,9 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, VK_SPACE,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
+
+use crate::config::Hotkey;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextW, MSG, SW_HIDE,
     SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
@@ -179,23 +179,21 @@ pub fn round_corners(hwnd: isize) {
     }
 }
 
-/// Registers Ctrl+Alt+Space on a dedicated thread and toggles the window on every press.
+/// Registers the toggle hotkey on a dedicated thread and toggles the window on every press.
 /// `RegisterHotKey` is fine here (unlike ferro-link) because the combination is dedicated.
-pub fn spawn_hotkey_thread(control: Arc<WindowControl>) -> Result<()> {
+pub fn spawn_hotkey_thread(
+    control: Arc<WindowControl>,
+    hotkey: Hotkey,
+    label: String,
+) -> Result<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     std::thread::Builder::new()
         .name("search-hotkey".into())
         .spawn(move || {
             // SAFETY: thread-level hotkey (no window); messages arrive in this thread's queue.
-            let registered = unsafe {
-                RegisterHotKey(
-                    None,
-                    1,
-                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-                    u32::from(VK_SPACE.0),
-                )
-            }
-            .context("Ctrl+Alt+Space is already used by another program");
+            let registered =
+                unsafe { RegisterHotKey(None, 1, hotkey.modifiers | MOD_NOREPEAT, hotkey.vk) }
+                    .with_context(|| format!("{label} is already used by another program"));
             let ok = registered.is_ok();
             let _ = ready_tx.send(registered);
             if !ok {
