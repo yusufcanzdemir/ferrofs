@@ -1,14 +1,12 @@
-//! Background thread that talks to the service so the UI never blocks on the pipe.
-//! Jobs from an older generation (the user navigated or changed the filter since) are
-//! dropped unexecuted.
+//! Background thread that talks to the service so the UI never blocks on the pipe. Each
+//! tool has its own worker (and connection). Jobs from an older generation (the user
+//! navigated or started a new search since) are dropped unexecuted.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use eframe::egui;
-use ferro_ipc::{
-    Client, ErrorCode, PIPE_NAME, Request, Response, ServerTrust, SizeTreeRequest, SizeTreeResponse,
-};
+use ferro_ipc::{Client, ErrorCode, PIPE_NAME, Request, Response, ServerTrust};
 
 /// Set to `1` to accept a service that is not running as a Windows service
 /// (e.g. `ferro-service run --console` or ferro-service's `fake_service` example).
@@ -20,13 +18,15 @@ pub enum JobKind {
     Navigate,
     /// Load the children of the folder at this path.
     Expand(String),
+    /// Find equal-size duplicate candidates.
+    Duplicates,
 }
 
 #[derive(Debug)]
 pub struct Job {
     pub generation: u64,
     pub kind: JobKind,
-    pub request: SizeTreeRequest,
+    pub request: Request,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,8 @@ pub struct Outcome {
     pub kind: JobKind,
     pub service: ServiceState,
     /// `Err` holds a message for the status line.
-    pub result: Result<SizeTreeResponse, String>,
+    /// Never `Response::Error`: errors arrive as `Err`.
+    pub result: Result<Response, String>,
 }
 
 pub fn spawn(ctx: egui::Context) -> std::io::Result<(Sender<Job>, Receiver<Outcome>)> {
@@ -100,8 +101,7 @@ fn run(client: &mut Option<Client>, trust: ServerTrust, job: Job) -> Outcome {
         let Some(connected) = client.as_mut() else {
             continue;
         };
-        match connected.request(&Request::SizeTree(job.request.clone())) {
-            Ok(Response::SizeTree(tree)) => return outcome(ServiceState::Connected, Ok(tree)),
+        match connected.request(&job.request) {
             Ok(Response::Error { code, message }) => {
                 let message = match code {
                     ErrorCode::BadQuery | ErrorCode::NotFound | ErrorCode::NotReady => message,
@@ -109,12 +109,7 @@ fn run(client: &mut Option<Client>, trust: ServerTrust, job: Job) -> Outcome {
                 };
                 return outcome(ServiceState::Connected, Err(message));
             }
-            Ok(other) => {
-                return outcome(
-                    ServiceState::Connected,
-                    Err(format!("unexpected response {other:?}")),
-                );
-            }
+            Ok(response) => return outcome(ServiceState::Connected, Ok(response)),
             Err(err) => {
                 tracing::info!("request failed, reconnecting: {err}");
                 *client = None;
