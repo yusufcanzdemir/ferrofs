@@ -50,7 +50,7 @@ UsedUserAreasWarning=no
 [Tasks]
 Name: "autostartsearch"; Description: "Start ferrofs search at sign-in (Ctrl+Alt+Space opens it)"; GroupDescription: "Start with Windows:"
 Name: "autostartlink"; Description: "Start ferrofs link at sign-in (Ctrl+B / Ctrl+G create links)"; GroupDescription: "Start with Windows:"
-Name: "desktopicon"; Description: "Desktop shortcut for ferrofs storage"; GroupDescription: "Shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "Desktop shortcut for ferrofs storage"; GroupDescription: "Shortcuts:"
 
 [Files]
 Source: "{#BinDir}\ferro-service.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -113,6 +113,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    { Refresh the shell's icon cache: shortcuts kept from an older version would
+      otherwise show the old (or a blank) icon until the next sign-in. }
+    RunHidden(ExpandConstant('{sys}\ie4uinit.exe'), '-show');
     if not RunHidden(ExpandConstant('{app}\ferro-service.exe'), 'install') then
     begin
       ServiceError := 'The ferrofs indexing service could not be installed or started. ' +
