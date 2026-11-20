@@ -57,6 +57,21 @@ const EXCLUDED_ANYWHERE: &[&[u8]] = &[
     b".cursor",
     b".windsurf",
     b"site-packages",
+    // Inside a dependency: its build output belongs to the package.
+    b"node_modules",
+    // Tool caches and installed toolchains.
+    b".cache",
+    b".rustup",
+    b".cargo",
+    b".pyenv",
+    b".conda",
+    b"miniconda3",
+    b"anaconda3",
+    b"msys64",
+    b"cygwin",
+    b"cygwin64",
+    b"scoop",
+    b"chocolatey",
     b".venv",
     b"venv",
 ];
@@ -283,6 +298,18 @@ mod tests {
             &["package.json", "package-lock.json"],
             &["node_modules"],
         );
+        let msys = t.add(5, "msys64", true);
+        t.project(msys, "python3", &[], &["__pycache__"]);
+        let cache = t.add(me, ".cache", true);
+        t.project(
+            cache,
+            "runtime",
+            &["package.json", "package-lock.json"],
+            &["node_modules"],
+        );
+        // `dist` of a package inside a dependency folder that is not an artifact itself.
+        let deps = t.add(dev, "node_modules", true);
+        t.project(deps, "lib", &["package.json"], &["dist"]);
         let windows = t.add(5, "Windows", true);
         t.project(windows, "x", &["Cargo.toml"], &["target"]);
         // Nested: only the outer node_modules.
