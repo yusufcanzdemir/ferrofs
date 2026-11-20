@@ -20,7 +20,7 @@ use eframe::egui;
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::core::{Owned, w};
+use windows::core::Owned;
 
 use crate::window::WindowControl;
 
@@ -44,8 +44,17 @@ fn window_icon() -> egui::IconData {
 fn main() -> Result<()> {
     let _log = logging::init()?;
 
-    // SAFETY: the name is a static literal; the handle is closed when `_instance` drops.
-    let mutex = unsafe { CreateMutexW(None, false, w!("Local\\ferrofs-search")) }?;
+    // A development instance on its own pipe may run next to the installed one.
+    let name: Vec<u16> = match std::env::var(ferro_ipc::DEV_PIPE_ENV) {
+        Ok(pipe) if !pipe.trim().is_empty() => format!("Local\\ferrofs-search-{}", pipe.trim()),
+        _ => "Local\\ferrofs-search".to_owned(),
+    }
+    .encode_utf16()
+    .chain([0])
+    .collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call; the handle is closed when
+    // `_instance` drops.
+    let mutex = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr())) }?;
     // SAFETY: no preconditions; read right after CreateMutexW.
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     // SAFETY: a fresh handle we own.

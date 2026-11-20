@@ -15,7 +15,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use ferro_core::volume::VolumeInfo;
 use ferro_core::{FoldOptions, Index, Name, NewEntry};
-use ferro_ipc::{PIPE_NAME, PipeServer};
+use ferro_ipc::{PipeServer, pipe_name};
 use ferro_service::engine::Engine;
 
 /// Seconds between 1601-01-01 (FILETIME epoch) and 1970-01-01, in 100 ns units.
@@ -54,7 +54,9 @@ fn walk(index: &mut Index, dir: &Path, parent: u64, next: &mut u64) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    let root = std::fs::canonicalize(&root)?;
+    // Absolute but not canonical: a `subst` drive stays `X:\` instead of turning into the
+    // folder behind it (used for demo screenshots that must not show real paths).
+    let root = std::path::absolute(&root)?;
     let display = root.display().to_string();
     let display = display
         .trim_start_matches(r"\\?\")
@@ -81,8 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::with_indexes(vec![(volume, index)], FoldOptions::default());
 
     // Interactive users may create instances too, because this runs unelevated.
-    let server = PipeServer::with_sddl(PIPE_NAME, "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)")?;
-    println!("serving {PIPE_NAME}; Ctrl+C to stop");
+    // FERROFS_DEV_PIPE moves it off the installed service's pipe.
+    let pipe = pipe_name();
+    let server = PipeServer::with_sddl(&pipe, "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)")?;
+    println!("serving {pipe}; Ctrl+C to stop");
     server.serve("fake", &|request| engine.handle(request))?;
     Ok(())
 }

@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use eframe::egui;
-use ferro_ipc::{Client, ErrorCode, PIPE_NAME, Request, Response, ServerTrust};
+use ferro_ipc::{Client, ErrorCode, Request, Response, ServerTrust};
 
 /// Set to `1` to accept a service that is not running as a Windows service
 /// (e.g. `ferro-service run --console` or ferro-service's `fake_service` example).
@@ -90,7 +90,12 @@ fn run(client: &mut Option<Client>, trust: ServerTrust, job: Job) -> Outcome {
     // One retry: the service may have restarted since the last request.
     for _ in 0..2 {
         if client.is_none() {
-            match Client::connect(PIPE_NAME, "ferro-storage", Duration::from_secs(2), trust) {
+            match Client::connect(
+                &ferro_ipc::pipe_name(),
+                "ferro-storage",
+                Duration::from_secs(2),
+                trust,
+            ) {
                 Ok(connected) => *client = Some(connected),
                 Err(ferro_ipc::Error::NotRunning) => {
                     return outcome(ServiceState::NotRunning, Err("service not running".into()));

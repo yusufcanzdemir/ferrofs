@@ -24,8 +24,8 @@ use anyhow::{Context, Result, bail};
 use ferro_core::FoldOptions;
 use ferro_core::volume::fixed_volumes;
 use ferro_ipc::{
-    CleanupScanRequest, Client, DuplicateCandidatesRequest, PIPE_NAME, PipeServer, Request,
-    Response, SearchRequest, ServerTrust, SizeTreeRequest, StopSignal,
+    CleanupScanRequest, Client, DuplicateCandidatesRequest, PipeServer, Request, Response,
+    SearchRequest, ServerTrust, SizeTreeRequest, StopSignal,
 };
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -108,7 +108,8 @@ unsafe extern "system" fn on_console_ctrl(_event: u32) -> BOOL {
 }
 
 fn run_console() -> Result<()> {
-    let server = PipeServer::new(PIPE_NAME)?;
+    // `run --console` honours FERROFS_DEV_PIPE (the installed service never does).
+    let server = PipeServer::new(&ferro_ipc::pipe_name())?;
     let _ = CONSOLE_STOP.set(server.stop_signal());
     // SAFETY: `on_console_ctrl` matches PHANDLER_ROUTINE and lives for the whole program.
     unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) }
@@ -119,7 +120,7 @@ fn run_console() -> Result<()> {
 fn connect() -> Result<Client> {
     // Debug commands also work against `run --console`, which is not in session 0.
     Client::connect(
-        PIPE_NAME,
+        &ferro_ipc::pipe_name(),
         "ferro-service-cli",
         Duration::from_secs(5),
         ServerTrust::Any,

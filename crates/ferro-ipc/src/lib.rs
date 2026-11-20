@@ -8,7 +8,7 @@ pub mod frame;
 pub mod pipe;
 pub mod protocol;
 
-pub use pipe::{Client, PIPE_NAME, PipeServer, ServerTrust, StopSignal};
+pub use pipe::{Client, DEV_PIPE_ENV, PIPE_NAME, PipeServer, ServerTrust, StopSignal, pipe_name};
 pub use protocol::*;
 
 /// Errors from the pipe transport and the protocol.

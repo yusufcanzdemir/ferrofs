@@ -39,6 +39,20 @@ use crate::protocol::{ErrorCode, PROTOCOL_VERSION, Request, Response};
 
 /// Pipe used by the service.
 pub const PIPE_NAME: &str = r"\\.\pipe\ferrofs";
+/// Environment variable that moves development servers and clients to another pipe, so
+/// they do not meet an installed service (the service itself always uses [`PIPE_NAME`]).
+pub const DEV_PIPE_ENV: &str = "FERROFS_DEV_PIPE";
+
+/// The pipe for clients and development servers: `\\.\pipe\<FERROFS_DEV_PIPE>` when that
+/// variable is set (a bare name such as `ferrofs-dev`), otherwise [`PIPE_NAME`].
+pub fn pipe_name() -> String {
+    match std::env::var(DEV_PIPE_ENV) {
+        Ok(name) if !name.trim().is_empty() => {
+            format!(r"\\.\pipe\{}", name.trim().trim_start_matches(r"\\.\pipe\"))
+        }
+        _ => PIPE_NAME.to_owned(),
+    }
+}
 /// SYSTEM and administrators: full access; interactive users: read/write (SPEC §3.2).
 pub const DEFAULT_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 
