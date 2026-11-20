@@ -711,6 +711,25 @@ fn collect<K: Ord + Send>(
     }
 }
 
+/// One flag per slot of `index`: true for live slots matching `query`. Runs in parallel;
+/// used to restrict size totals to matching files (e.g. `ext:mp4`).
+pub fn match_mask(index: &Index, query: &Query) -> Vec<bool> {
+    let mut mask = vec![false; index.slot_count()];
+    mask.par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(chunk, flags)| {
+            let mut scratch = Scratch::default();
+            let start = chunk * CHUNK;
+            for (i, flag) in flags.iter_mut().enumerate() {
+                // Slot counts are bounded by u32 (see Index::alloc_slot).
+                #[allow(clippy::cast_possible_truncation)]
+                let slot = (start + i) as u32;
+                *flag = index.is_live(slot) && query.matches(index, slot, &mut scratch);
+            }
+        });
+    mask
+}
+
 fn keep_best<T>(items: &mut Vec<T>, keep: usize, order: impl Fn(&T, &T) -> std::cmp::Ordering) {
     if items.len() > keep {
         if keep > 0 {

@@ -6,7 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ferro_core::{FoldOptions, Index, Name, NewEntry, Query, search};
+use ferro_core::{FoldOptions, Index, Name, NewEntry, Query, SizeTotals, match_mask, search};
 
 const WORDS: &[&str] = &[
     "report",
@@ -86,9 +86,13 @@ fn build(names: &[(u64, u64, String, u32)]) -> Index {
             parent_frn: *parent,
             name: Name::Utf8(name),
             attributes: *attributes,
-            size: 0,
+            size: if *attributes & 0x10 == 0 {
+                frn.wrapping_mul(2_654_435_761) % 50_000_000
+            } else {
+                0
+            },
             alloc_size: 0,
-            mtime: 0,
+            mtime: *frn,
         });
     }
     index
@@ -127,6 +131,31 @@ fn benches(c: &mut Criterion) {
         let query = Query::parse(text, FoldOptions::default()).expect("valid query");
         group.bench_function(text, |b| b.iter(|| black_box(search(&index, &query, 100))));
     }
+    group.finish();
+
+    let totals = SizeTotals::build(&index, None);
+    eprintln!(
+        "size totals: {:.1} bytes/entry",
+        totals.heap_bytes() as f64 / index.len() as f64
+    );
+    let mut group = c.benchmark_group("size totals 2M");
+    group.sample_size(10);
+    group.bench_function("build", |b| {
+        b.iter(|| black_box(SizeTotals::build(&index, None)))
+    });
+    let filter = Query::parse("ext:jpg;png", FoldOptions::default()).expect("valid query");
+    group.bench_function("build ext:jpg;png", |b| {
+        b.iter(|| {
+            let mask = match_mask(&index, &filter);
+            black_box(SizeTotals::build(&index, Some(mask)))
+        })
+    });
+    group.bench_function("largest 100 + extensions 50", |b| {
+        b.iter(|| {
+            black_box(totals.largest_files(&index, None, 100));
+            black_box(totals.extensions(&index, None, 50))
+        })
+    });
     group.finish();
 }
 

@@ -392,6 +392,11 @@ impl Index {
             .filter(|&p| p != NONE && p != slot)
     }
 
+    /// True if the entry sits directly in the volume root folder.
+    pub fn is_top_level(&self, slot: u32) -> bool {
+        self.parent[slot as usize] == ROOT_RECORD
+    }
+
     /// Slots from `slot` up to the top-level ancestor, written into `chain`.
     fn ancestors_into(&self, slot: u32, chain: &mut Vec<u32>) {
         chain.clear();
