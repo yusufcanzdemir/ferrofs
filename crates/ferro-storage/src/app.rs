@@ -4,6 +4,7 @@ use eframe::egui::{self, RichText};
 
 use crate::analyzer::Analyzer;
 use crate::cleanup::Cleanup;
+use crate::compression::Compression;
 use crate::duplicates::Duplicates;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +12,7 @@ pub enum Tool {
     Analyzer,
     Duplicates,
     Cleanup,
+    Compression,
 }
 
 pub struct App {
@@ -18,6 +20,7 @@ pub struct App {
     analyzer: Analyzer,
     duplicates: Duplicates,
     cleanup: Cleanup,
+    compression: Compression,
     dry_run: bool,
 }
 
@@ -27,6 +30,7 @@ impl App {
         analyzer: Analyzer,
         duplicates: Duplicates,
         cleanup: Cleanup,
+        compression: Compression,
         dry_run: bool,
     ) -> Self {
         Self {
@@ -34,6 +38,7 @@ impl App {
             analyzer,
             duplicates,
             cleanup,
+            compression,
             dry_run,
         }
     }
@@ -47,6 +52,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tool, Tool::Analyzer, "Analyzer");
                 ui.selectable_value(&mut self.tool, Tool::Duplicates, "Duplicates");
                 ui.selectable_value(&mut self.tool, Tool::Cleanup, "Cleanup");
+                ui.selectable_value(&mut self.tool, Tool::Compression, "Compression");
                 if self.dry_run {
                     ui.separator();
                     ui.label(
@@ -61,6 +67,7 @@ impl eframe::App for App {
             Tool::Analyzer => self.analyzer.update(ctx),
             Tool::Duplicates => self.duplicates.update(ctx),
             Tool::Cleanup => self.cleanup.update(ctx),
+            Tool::Compression => self.compression.update(ctx),
         }
     }
 }

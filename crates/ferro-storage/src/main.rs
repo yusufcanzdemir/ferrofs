@@ -3,12 +3,14 @@
 //!   files and a per-extension breakdown;
 //! - duplicate finder (SPEC §5.2): equal-size files from the index, compared by content,
 //!   removed or replaced with hard links after a preview;
-//! - cleanup (SPEC §5.4): temporary files, package caches and build output.
+//! - cleanup (SPEC §5.4): temporary files, package caches and build output;
+//! - compression (SPEC §5.3): WOF compression of program folders, with estimates and undo.
 //!
 //! ```text
 //! ferro-storage [folder]                 analyzer at `folder` (default: all volumes)
 //! ferro-storage --duplicates [folder]    duplicate finder; searches `folder` right away
 //! ferro-storage --cleanup [folder]       cleanup; scans right away (build output in `folder`)
+//! ferro-storage --compression [folder]   compression; analyzes `folder` right away
 //! ferro-storage --dry-run ...            destructive actions are only previewed and logged
 //! ```
 
@@ -19,6 +21,8 @@ mod analyzer;
 mod app;
 mod cleaner;
 mod cleanup;
+mod compression;
+mod compressor;
 mod duplicates;
 mod elevation;
 mod format;
@@ -29,6 +33,7 @@ mod paint;
 mod shell;
 mod tree;
 mod treemap;
+mod wof;
 mod worker;
 
 use anyhow::{Result, anyhow};
@@ -44,6 +49,7 @@ const TITLE: &str = "ferrofs storage";
 struct Args {
     duplicates: bool,
     cleanup: bool,
+    compression: bool,
     dry_run: bool,
     folder: Option<String>,
 }
@@ -54,6 +60,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
         match arg.as_str() {
             "--duplicates" => parsed.duplicates = true,
             "--cleanup" => parsed.cleanup = true,
+            "--compression" => parsed.compression = true,
             "--dry-run" => parsed.dry_run = true,
             // `"C:\"` arrives as `C:"` because `\"` escapes the quote: trim quotes.
             _ => parsed.folder = Some(arg.trim().trim_matches('"').to_owned()),
@@ -85,7 +92,7 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let (jobs, outcomes) = worker::spawn(ctx.clone())?;
-            let analyzer_start = if args.duplicates || args.cleanup {
+            let analyzer_start = if args.duplicates || args.cleanup || args.compression {
                 String::new()
             } else {
                 args.folder.clone().unwrap_or_default()
@@ -106,8 +113,21 @@ fn main() -> Result<()> {
                 String::new()
             };
             let mut cleanup =
-                cleanup::Cleanup::new(ctx, jobs, outcomes, clean_folder, args.dry_run);
-            let tool = if args.cleanup {
+                cleanup::Cleanup::new(ctx.clone(), jobs, outcomes, clean_folder, args.dry_run);
+            let (jobs, outcomes) = worker::spawn(ctx.clone())?;
+            let compress_folder = if args.compression {
+                args.folder.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let mut compression =
+                compression::Compression::new(ctx, jobs, outcomes, compress_folder, args.dry_run);
+            let tool = if args.compression {
+                if args.folder.is_some() {
+                    compression.analyze();
+                }
+                Tool::Compression
+            } else if args.cleanup {
                 cleanup.scan();
                 Tool::Cleanup
             } else if args.duplicates {
@@ -123,6 +143,7 @@ fn main() -> Result<()> {
                 analyzer,
                 duplicates,
                 cleanup,
+                compression,
                 args.dry_run,
             )))
         }),
@@ -153,5 +174,6 @@ mod tests {
         );
         assert_eq!(parse(&[r"D:\Photos"]).folder.as_deref(), Some(r"D:\Photos"));
         assert!(parse(&["--cleanup"]).cleanup);
+        assert!(parse(&["--compression"]).compression);
     }
 }
