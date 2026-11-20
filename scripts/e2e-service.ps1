@@ -1,7 +1,8 @@
 # End-to-end test of ferro-service in console mode. Run elevated:
 #   Start-Process pwsh -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$PWD\scripts\e2e-service.ps1"
-# On the test VHD: search after the initial MFT scan, live size refresh, then a restart
-# from the snapshot with changes made while the service was down (journal replay).
+# On the test VHD: search after the initial MFT scan, live size refresh, folder sizes
+# (SizeTree, also timed on C:\), then a restart from the snapshot with changes made while
+# the service was down (journal replay).
 # Writes target\e2e-service.ready and waits (up to 120 s) for target\e2e-service.done so an
 # unelevated shell can query the pipe too. Log: target\e2e-service.log
 $ErrorActionPreference = 'Continue'
@@ -28,6 +29,7 @@ function Start-Service-Console {
   $p
 }
 function Query($text) { Log "--- query $text ---"; & $exe query $text *>> $log }
+function Sizes($folder) { Log "--- sizes $folder ---"; & $exe sizes $folder *>> $log }
 
 $service = $null
 $before = Get-Date
@@ -49,6 +51,9 @@ try {
   Query 'grow.bin'
   Query "size:>4kb path:${root}e2e"
   Query 'dm:today grow'
+  Sizes "${root}e2e"
+  Sizes 'C:\'
+  Sizes 'C:\Windows'
 
   # Restart from the snapshot; changes made while the service is down come from the journal.
   Stop-Process -Id $service.Id -Force
