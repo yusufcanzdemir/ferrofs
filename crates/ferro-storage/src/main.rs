@@ -44,6 +44,21 @@ use crate::app::Tool;
 
 const TITLE: &str = "ferrofs storage";
 
+/// Shared ferrofs artwork (`assets/icons.rs`).
+mod art {
+    include!("../../../assets/icons.rs");
+}
+
+/// Window and taskbar icon (replaces eframe's default logo).
+fn window_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    egui::IconData {
+        rgba: art::render_icon(art::IconKind::Storage, SIZE),
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
 /// Parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
@@ -83,7 +98,8 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_inner_size([1360.0, 820.0])
-            .with_min_inner_size([800.0, 480.0]),
+            .with_min_inner_size([800.0, 480.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(

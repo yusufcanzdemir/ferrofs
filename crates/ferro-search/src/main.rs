@@ -26,6 +26,21 @@ use crate::window::WindowControl;
 
 const TITLE: &str = "ferrofs search";
 
+/// Shared ferrofs artwork (`assets/icons.rs`).
+mod art {
+    include!("../../../assets/icons.rs");
+}
+
+/// Window and taskbar icon (replaces eframe's default logo).
+fn window_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    egui::IconData {
+        rgba: art::render_icon(art::IconKind::Search, SIZE),
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
 fn main() -> Result<()> {
     let _log = logging::init()?;
 
@@ -50,6 +65,7 @@ fn main() -> Result<()> {
             .with_title(TITLE)
             .with_inner_size([820.0, 500.0])
             .with_min_inner_size([480.0, 240.0])
+            .with_icon(window_icon())
             .with_decorations(false)
             .with_taskbar(false)
             .with_always_on_top()
