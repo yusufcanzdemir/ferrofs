@@ -1,5 +1,7 @@
 # Rust build output
 /target/
+# Built installers (scripts/build-installer.ps1 copies the latest here)
+/dist/
 **/*.rs.bk
 *.pdb
 

@@ -25,6 +25,14 @@ expect_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
 
+# Keep target/ small: dependencies without debug info, our code with line tables only
+# (backtraces still show file:line). Full debug info made target/ grow past 15 GB.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

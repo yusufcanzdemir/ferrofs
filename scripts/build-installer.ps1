@@ -27,4 +27,7 @@ foreach ($bin in 'ferro-service', 'ferro-search', 'ferro-storage', 'ferro-link')
 & $iscc /Q "/DAppVersion=$version" "/DBinDir=$repo\target\release" "/DOutputDir=$repo\target\installer" "$repo\installer\ferrofs.iss"
 if ($LASTEXITCODE) { throw "ISCC failed ($LASTEXITCODE)" }
 $setup = "$repo\target\installer\ferrofs-setup-$version.exe"
+# Keep a copy outside target\, so `cargo clean` does not delete the last installer.
+New-Item -ItemType Directory -Force "$repo\dist" | Out-Null
+Copy-Item $setup "$repo\dist\" -Force
 "{0} ({1:N1} MB)" -f $setup, ((Get-Item $setup).Length / 1MB)
