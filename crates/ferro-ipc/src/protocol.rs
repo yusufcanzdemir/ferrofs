@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change; both sides must agree (checked in the handshake).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Sent by the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +20,9 @@ pub enum Request {
     SizeTree(SizeTreeRequest),
     /// Files of equal size, the first step of the duplicate finder (SPEC §5.2).
     DuplicateCandidates(DuplicateCandidatesRequest),
+    /// Developer artifacts (build output, dependency folders) for the cleanup scanner
+    /// (SPEC §5.4).
+    CleanupScan(CleanupScanRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +90,16 @@ pub struct DuplicateCandidatesRequest {
     pub max_files: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupScanRequest {
+    /// Folders to search; empty = all volumes.
+    pub roots: Vec<String>,
+    /// Also report Python virtual environments (`.venv` / `venv` with `pyvenv.cfg`).
+    pub include_venv: bool,
+    /// Smaller artifacts are left out.
+    pub min_size: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sort {
     #[default]
@@ -108,6 +121,7 @@ pub enum Response {
     Volumes(Vec<VolumeStatus>),
     SizeTree(SizeTreeResponse),
     DuplicateCandidates(DuplicateCandidatesResponse),
+    CleanupScan(CleanupScanResponse),
     Error {
         code: ErrorCode,
         message: String,
@@ -208,6 +222,43 @@ pub struct DuplicateCandidatesResponse {
 pub struct SizeGroup {
     pub size: u64,
     pub files: Vec<Row>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupScanResponse {
+    /// Largest first.
+    pub artifacts: Vec<CleanupArtifact>,
+    pub took_us: u64,
+    /// False while some volumes are still being indexed.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupArtifact {
+    pub kind: ArtifactKind,
+    /// The artifact folder.
+    pub path: String,
+    pub size: u64,
+    pub alloc_size: u64,
+    pub files: u64,
+    /// Newest modification time inside (FILETIME).
+    pub mtime: u64,
+    /// Marker file next to (or, for virtual environments, inside) the folder that made it
+    /// an artifact; re-checked before deletion. Empty if none is needed.
+    pub marker: String,
+}
+
+/// Mirrors `ferro_core::cleanup::ArtifactKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArtifactKind {
+    NodeModules,
+    RustTarget,
+    MavenTarget,
+    GradleCache,
+    Build,
+    Dist,
+    PyCache,
+    PythonVenv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

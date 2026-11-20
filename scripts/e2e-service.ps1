@@ -55,6 +55,7 @@ try {
   Sizes 'C:\'
   Sizes 'C:\Windows'
   Log '--- dupes C:\ ---'; & $exe dupes 'C:\' *>> $log
+  Log '--- cleanup C:\ ---'; & $exe cleanup 'C:\' *>> $log
 
   # Restart from the snapshot; changes made while the service is down come from the journal.
   Stop-Process -Id $service.Id -Force

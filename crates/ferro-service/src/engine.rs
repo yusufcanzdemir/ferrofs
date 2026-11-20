@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
+use ferro_core::cleanup::{self, Artifact, ArtifactKind as CoreArtifactKind, find_artifacts};
 use ferro_core::duplicates::{candidate_files, group_by_size};
 use ferro_core::index::flags;
 use ferro_core::metadata::{self, Metadata, MetadataReader};
@@ -18,6 +19,7 @@ use ferro_core::{
     search_volumes,
 };
 use ferro_ipc::{
+    ArtifactKind, CleanupArtifact, CleanupScanRequest, CleanupScanResponse,
     DuplicateCandidatesRequest, DuplicateCandidatesResponse, ErrorCode, ExtensionRow, Request,
     Response, Row, SearchRequest, SearchResponse, SizeGroup, SizeNode, SizeRest, SizeTreeRequest,
     SizeTreeResponse, Sort, Stats, VolumeState, VolumeStatus,
@@ -330,6 +332,7 @@ impl Engine {
             Request::VolumeList => Response::Volumes(self.volume_statuses()),
             Request::SizeTree(request) => self.size_tree(&request),
             Request::DuplicateCandidates(request) => self.duplicate_candidates(&request),
+            Request::CleanupScan(request) => self.cleanup_scan(&request),
             Request::Hello { .. } => error(ErrorCode::BadRequest, "duplicate Hello"),
         }
     }
@@ -623,6 +626,81 @@ impl Engine {
         })
     }
 
+    fn cleanup_scan(&self, request: &CleanupScanRequest) -> Response {
+        if self.volumes.is_empty() {
+            return error(ErrorCode::NotReady, "no NTFS volume is available");
+        }
+        let started = Instant::now();
+        let guards: Vec<_> = self.volumes.iter().map(|v| self.read_state(v)).collect();
+        let ready: Vec<(&Volume, &Index)> = self
+            .volumes
+            .iter()
+            .zip(&guards)
+            .filter_map(|(volume, state)| match &**state {
+                State::Ready { index, .. } => Some((volume, &**index)),
+                _ => None,
+            })
+            .collect();
+        let complete = ready.len() == self.volumes.len();
+        let totals: Vec<Arc<SizeTotals>> = ready
+            .iter()
+            .map(|&(volume, index)| self.size_totals(volume, index, "", None))
+            .collect();
+
+        let mut targets: Vec<(usize, Option<u32>)> = Vec::new();
+        if request.roots.iter().all(|root| root.trim().is_empty()) {
+            targets.extend((0..ready.len()).map(|i| (i, None)));
+        }
+        for root in request
+            .roots
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+        {
+            let Some(volume) = self.volume_for(root) else {
+                let message = format!("{root} is not on an indexed volume");
+                return error(ErrorCode::NotFound, &message);
+            };
+            let Some(i) = ready.iter().position(|(v, _)| std::ptr::eq(*v, volume)) else {
+                let message = format!("{} is still being indexed", volume.info.root);
+                return error(ErrorCode::NotReady, &message);
+            };
+            let relative = root.get(volume.info.root.len()..).unwrap_or_default();
+            let Some(folder) = totals[i].resolve(ready[i].1, relative) else {
+                return error(ErrorCode::NotFound, &format!("{root} was not found"));
+            };
+            targets.push((i, folder));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut artifacts = Vec::new();
+        for (i, folder) in targets {
+            let (index, totals) = (ready[i].1, &totals[i]);
+            for artifact in find_artifacts(index, totals, folder, request.include_venv) {
+                let own = totals.totals(index, artifact.slot);
+                if own.size < request.min_size || !seen.insert((i, artifact.slot)) {
+                    continue;
+                }
+                let path = index.path(artifact.slot);
+                artifacts.push(CleanupArtifact {
+                    kind: ipc_kind(artifact.kind),
+                    marker: marker_path(index, totals, artifact),
+                    path,
+                    size: own.size,
+                    alloc_size: own.alloc_size,
+                    files: own.files,
+                    mtime: own.mtime,
+                });
+            }
+        }
+        artifacts.sort_by_key(|a| std::cmp::Reverse(a.size));
+        Response::CleanupScan(CleanupScanResponse {
+            artifacts,
+            took_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            complete,
+        })
+    }
+
     /// The volume whose root (`C:\`) starts `path`, ignoring case; `C:` alone matches too.
     fn volume_for(&self, path: &str) -> Option<&Volume> {
         self.volumes.iter().find(|volume| {
@@ -678,6 +756,37 @@ fn error(code: ErrorCode, message: &str) -> Response {
         code,
         message: message.to_owned(),
     }
+}
+
+/// Maps the core artifact kind to its protocol twin.
+fn ipc_kind(kind: CoreArtifactKind) -> ArtifactKind {
+    match kind {
+        CoreArtifactKind::NodeModules => ArtifactKind::NodeModules,
+        CoreArtifactKind::RustTarget => ArtifactKind::RustTarget,
+        CoreArtifactKind::MavenTarget => ArtifactKind::MavenTarget,
+        CoreArtifactKind::GradleCache => ArtifactKind::GradleCache,
+        CoreArtifactKind::Build => ArtifactKind::Build,
+        CoreArtifactKind::Dist => ArtifactKind::Dist,
+        CoreArtifactKind::PyCache => ArtifactKind::PyCache,
+        CoreArtifactKind::PythonVenv => ArtifactKind::PythonVenv,
+    }
+}
+
+/// Path of the marker file that made `artifact` one (next to it, or inside it for virtual
+/// environments); empty if the kind needs none.
+fn marker_path(index: &Index, totals: &SizeTotals, artifact: Artifact) -> String {
+    let folder = if artifact.kind == CoreArtifactKind::PythonVenv {
+        Some(artifact.slot)
+    } else {
+        index.parent_of(artifact.slot)
+    };
+    let names = cleanup::markers(artifact.kind);
+    totals
+        .children(index, folder)
+        .into_iter()
+        .find(|&c| names.contains(&index.folded_name(c)))
+        .map(|c| index.path(c))
+        .unwrap_or_default()
 }
 
 /// Drops the cached size totals of `volume` once no analyzer has asked for a while.
@@ -1216,5 +1325,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cleanup_scan_reports_artifacts_with_markers() {
+        let mut c = Index::new(r"C:\", FoldOptions::default());
+        for (frn, parent, name, dir, size) in [
+            (20, 5, "dev", true, 0),
+            (21, 20, "app", true, 0),
+            (22, 21, "Cargo.toml", false, 100),
+            (23, 21, "target", true, 0),
+            (24, 23, "big.rlib", false, 5_000_000),
+            (30, 20, "web", true, 0),
+            (31, 30, "package.json", false, 100),
+            (32, 30, "yarn.lock", false, 100),
+            (33, 30, "node_modules", true, 0),
+            (34, 33, "lib.js", false, 2_000_000),
+            (40, 20, "tiny", true, 0),
+            (41, 40, "Cargo.toml", false, 100),
+            (42, 40, "target", true, 0),
+            (43, 42, "x", false, 10),
+        ] {
+            c.upsert(&NewEntry {
+                frn,
+                parent_frn: parent,
+                name: Name::Utf8(name),
+                attributes: if dir { 0x10 } else { 0x20 },
+                size,
+                alloc_size: size,
+                mtime: frn,
+            });
+        }
+        let engine = Engine::with_indexes(vec![(info(r"C:\"), c)], FoldOptions::default());
+        let response = engine.handle(Request::CleanupScan(CleanupScanRequest {
+            roots: vec![r"C:\dev".into()],
+            include_venv: false,
+            min_size: 1000,
+        }));
+        let Response::CleanupScan(scan) = response else {
+            panic!("unexpected {response:?}");
+        };
+        assert!(scan.complete);
+        let found: Vec<_> = scan
+            .artifacts
+            .iter()
+            .map(|a| (a.kind, a.path.as_str(), a.size, a.marker.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    ArtifactKind::RustTarget,
+                    r"C:\dev\app\target",
+                    5_000_000,
+                    r"C:\dev\app\Cargo.toml"
+                ),
+                (
+                    ArtifactKind::NodeModules,
+                    r"C:\dev\web\node_modules",
+                    2_000_000,
+                    r"C:\dev\web\package.json"
+                ),
+            ],
+            "tiny\\target is below min_size"
+        );
     }
 }

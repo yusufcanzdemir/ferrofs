@@ -8,6 +8,7 @@
 //! ferro-service query <text>     search, via the pipe
 //! ferro-service sizes [folder]   folder sizes and largest files, via the pipe
 //! ferro-service dupes [folder]   equal-size duplicate candidates, via the pipe
+//! ferro-service cleanup [folder] developer artifacts (build output), via the pipe
 //! ```
 //! Without arguments the binary expects to be started by the service control manager.
 
@@ -23,8 +24,8 @@ use anyhow::{Context, Result, bail};
 use ferro_core::FoldOptions;
 use ferro_core::volume::fixed_volumes;
 use ferro_ipc::{
-    Client, DuplicateCandidatesRequest, PIPE_NAME, PipeServer, Request, Response, SearchRequest,
-    ServerTrust, SizeTreeRequest, StopSignal,
+    CleanupScanRequest, Client, DuplicateCandidatesRequest, PIPE_NAME, PipeServer, Request,
+    Response, SearchRequest, ServerTrust, SizeTreeRequest, StopSignal,
 };
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -52,8 +53,9 @@ fn main() -> Result<()> {
         ["query", words @ ..] => query(&words.join(" ")),
         ["sizes", folder @ ..] => sizes(&folder.join(" ")),
         ["dupes", folder @ ..] => dupes(&folder.join(" ")),
+        ["cleanup", folder @ ..] => cleanup(&folder.join(" ")),
         _ => bail!(
-            "usage: ferro-service [install | uninstall | run --console | status | query <text> | sizes [folder] | dupes [folder]]"
+            "usage: ferro-service [install | uninstall | run --console | status | query <text> | sizes [folder] | dupes [folder] | cleanup [folder]]"
         ),
     }
 }
@@ -249,6 +251,43 @@ fn dupes(root: &str) -> Result<()> {
                 result.total_files,
                 listed,
                 result.took_us as f64 / 1000.0
+            );
+            Ok(())
+        }
+        Response::Error { code, message } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+/// Prints developer artifacts below `root` (empty = all volumes), for manual checks.
+fn cleanup(root: &str) -> Result<()> {
+    let mut client = connect()?;
+    let request = CleanupScanRequest {
+        roots: if root.is_empty() {
+            Vec::new()
+        } else {
+            vec![root.to_owned()]
+        },
+        include_venv: true,
+        min_size: 1 << 20,
+    };
+    match client.request(&Request::CleanupScan(request))? {
+        Response::CleanupScan(scan) => {
+            let mb = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+            for artifact in scan.artifacts.iter().take(25) {
+                println!(
+                    "{:>10.1} MB  {:?}  {}",
+                    mb(artifact.size),
+                    artifact.kind,
+                    artifact.path
+                );
+            }
+            let total: u64 = scan.artifacts.iter().map(|a| a.size).sum();
+            println!(
+                "-- {} artifacts, {:.1} MB, in {:.2} ms",
+                scan.artifacts.len(),
+                mb(total),
+                scan.took_us as f64 / 1000.0
             );
             Ok(())
         }
