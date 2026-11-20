@@ -302,6 +302,40 @@ impl SizeTotals {
         }
     }
 
+    /// True if `folder` (`None` = volume root) has a child, visible or not, whose folded
+    /// name is one of `names`.
+    pub fn has_child_named(&self, index: &Index, folder: Option<u32>, names: &[&[u8]]) -> bool {
+        self.raw_children(folder)
+            .iter()
+            .any(|&c| index.is_live(c) && names.contains(&index.folded_name(c)))
+    }
+
+    /// Predicate "this slot is a folder reachable from the root and strictly below
+    /// `folder`" (`None` = anywhere on the volume).
+    pub fn folder_below(&self, folder: Option<u32>) -> impl Fn(u32) -> bool + Sync {
+        let range = match folder {
+            None => Some((0, u32::MAX)),
+            Some(slot) => match self.dir_id.get(slot as usize) {
+                Some(&d) if d != NOT_DIR && self.tour_in[d as usize] != LOST => {
+                    Some((self.tour_in[d as usize] + 1, self.tour_end[d as usize]))
+                }
+                _ => None,
+            },
+        };
+        move |slot: u32| {
+            let Some((low, high)) = range else {
+                return false;
+            };
+            match self.dir_id.get(slot as usize) {
+                Some(&d) if d != NOT_DIR => {
+                    let position = self.tour_in[d as usize];
+                    position != LOST && position >= low && position < high
+                }
+                _ => false,
+            }
+        }
+    }
+
     /// Visible children of `folder` (`None` = volume root), largest first (ties by slot).
     pub fn children(&self, index: &Index, folder: Option<u32>) -> Vec<u32> {
         let mut list: Vec<(u64, u32)> = self
