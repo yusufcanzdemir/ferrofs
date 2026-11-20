@@ -7,6 +7,7 @@
 //! ferro-service status           volume states, via the pipe
 //! ferro-service query <text>     search, via the pipe
 //! ferro-service sizes [folder]   folder sizes and largest files, via the pipe
+//! ferro-service dupes [folder]   equal-size duplicate candidates, via the pipe
 //! ```
 //! Without arguments the binary expects to be started by the service control manager.
 
@@ -22,8 +23,8 @@ use anyhow::{Context, Result, bail};
 use ferro_core::FoldOptions;
 use ferro_core::volume::fixed_volumes;
 use ferro_ipc::{
-    Client, PIPE_NAME, PipeServer, Request, Response, SearchRequest, ServerTrust, SizeTreeRequest,
-    StopSignal,
+    Client, DuplicateCandidatesRequest, PIPE_NAME, PipeServer, Request, Response, SearchRequest,
+    ServerTrust, SizeTreeRequest, StopSignal,
 };
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -50,8 +51,9 @@ fn main() -> Result<()> {
         ["status"] => status(),
         ["query", words @ ..] => query(&words.join(" ")),
         ["sizes", folder @ ..] => sizes(&folder.join(" ")),
+        ["dupes", folder @ ..] => dupes(&folder.join(" ")),
         _ => bail!(
-            "usage: ferro-service [install | uninstall | run --console | status | query <text> | sizes [folder]]"
+            "usage: ferro-service [install | uninstall | run --console | status | query <text> | sizes [folder] | dupes [folder]]"
         ),
     }
 }
@@ -211,6 +213,43 @@ fn sizes(root: &str) -> Result<()> {
                 );
             }
             println!("-- {:.2} ms", tree.took_us as f64 / 1000.0);
+            Ok(())
+        }
+        Response::Error { code, message } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+/// Prints equal-size candidate groups below `root` (empty = all volumes), for manual checks.
+fn dupes(root: &str) -> Result<()> {
+    let mut client = connect()?;
+    let request = DuplicateCandidatesRequest {
+        roots: if root.is_empty() {
+            Vec::new()
+        } else {
+            vec![root.to_owned()]
+        },
+        min_size: 64 * 1024,
+        filter: String::new(),
+        max_files: 200_000,
+    };
+    match client.request(&Request::DuplicateCandidates(request))? {
+        Response::DuplicateCandidates(result) => {
+            let mb = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+            for group in result.groups.iter().take(10) {
+                println!("{:>10.1} MB x {}", mb(group.size), group.files.len());
+                for file in group.files.iter().take(3) {
+                    println!("              {}", file.path);
+                }
+            }
+            let listed: usize = result.groups.iter().map(|g| g.files.len()).sum();
+            println!(
+                "-- {} groups / {} files of equal size ({} files listed) in {:.2} ms",
+                result.total_groups,
+                result.total_files,
+                listed,
+                result.took_us as f64 / 1000.0
+            );
             Ok(())
         }
         Response::Error { code, message } => bail!("{code:?}: {message}"),

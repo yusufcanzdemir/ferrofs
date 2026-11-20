@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
+use ferro_core::duplicates::{candidate_files, group_by_size};
 use ferro_core::index::flags;
 use ferro_core::metadata::{self, Metadata, MetadataReader};
 use ferro_core::snapshot::{self, Header};
@@ -17,8 +18,9 @@ use ferro_core::{
     search_volumes,
 };
 use ferro_ipc::{
-    ErrorCode, ExtensionRow, Request, Response, Row, SearchRequest, SearchResponse, SizeNode,
-    SizeRest, SizeTreeRequest, SizeTreeResponse, Sort, Stats, VolumeState, VolumeStatus,
+    DuplicateCandidatesRequest, DuplicateCandidatesResponse, ErrorCode, ExtensionRow, Request,
+    Response, Row, SearchRequest, SearchResponse, SizeGroup, SizeNode, SizeRest, SizeTreeRequest,
+    SizeTreeResponse, Sort, Stats, VolumeState, VolumeStatus,
 };
 
 /// Largest page a client may request.
@@ -37,6 +39,8 @@ const MAX_TREE_CHILDREN: u32 = 5_000;
 const MAX_TREE_REPORT: u32 = 1_000;
 /// Cached size totals are dropped after this long without a request.
 const TOTALS_IDLE: Duration = Duration::from_secs(60);
+/// Most files in one duplicate candidates response.
+const MAX_DUPLICATE_FILES: u32 = 200_000;
 
 #[derive(Debug)]
 enum State {
@@ -325,6 +329,7 @@ impl Engine {
             Request::Stats => Response::Stats(self.stats()),
             Request::VolumeList => Response::Volumes(self.volume_statuses()),
             Request::SizeTree(request) => self.size_tree(&request),
+            Request::DuplicateCandidates(request) => self.duplicate_candidates(&request),
             Request::Hello { .. } => error(ErrorCode::BadRequest, "duplicate Hello"),
         }
     }
@@ -513,6 +518,106 @@ impl Engine {
             root: node,
             largest,
             extensions,
+            took_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            complete,
+        })
+    }
+
+    fn duplicate_candidates(&self, request: &DuplicateCandidatesRequest) -> Response {
+        if self.volumes.is_empty() {
+            return error(ErrorCode::NotReady, "no NTFS volume is available");
+        }
+        let filter = request.filter.trim();
+        let query = if filter.is_empty() {
+            None
+        } else {
+            match Query::parse(filter, self.fold) {
+                Ok(query) => Some(query),
+                Err(err) => return error(ErrorCode::BadQuery, &err.to_string()),
+            }
+        };
+        let started = Instant::now();
+        let guards: Vec<_> = self.volumes.iter().map(|v| self.read_state(v)).collect();
+        let ready: Vec<(&Volume, &Index)> = self
+            .volumes
+            .iter()
+            .zip(&guards)
+            .filter_map(|(volume, state)| match &**state {
+                State::Ready { index, .. } => Some((volume, &**index)),
+                _ => None,
+            })
+            .collect();
+        let complete = ready.len() == self.volumes.len();
+        let totals: Vec<Arc<SizeTotals>> = ready
+            .iter()
+            .map(|&(volume, index)| self.size_totals(volume, index, filter, query.as_ref()))
+            .collect();
+
+        // (position in `ready`, folder) to search.
+        let mut targets: Vec<(usize, Option<u32>)> = Vec::new();
+        if request.roots.iter().all(|root| root.trim().is_empty()) {
+            targets.extend((0..ready.len()).map(|i| (i, None)));
+        }
+        for root in request
+            .roots
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+        {
+            let Some(volume) = self.volume_for(root) else {
+                let message = format!("{root} is not on an indexed volume");
+                return error(ErrorCode::NotFound, &message);
+            };
+            let Some(i) = ready.iter().position(|(v, _)| std::ptr::eq(*v, volume)) else {
+                let message = format!("{} is still being indexed", volume.info.root);
+                return error(ErrorCode::NotReady, &message);
+            };
+            let relative = root.get(volume.info.root.len()..).unwrap_or_default();
+            let Some(folder) = totals[i].resolve(ready[i].1, relative) else {
+                return error(ErrorCode::NotFound, &format!("{root} was not found"));
+            };
+            targets.push((i, folder));
+        }
+
+        let mut files: Vec<(u64, (u32, u32))> = Vec::new();
+        for (i, folder) in targets {
+            let volume = u32::try_from(i).unwrap_or(u32::MAX);
+            let found = candidate_files(ready[i].1, &totals[i], folder, request.min_size);
+            files.extend(found.into_iter().map(|(size, slot)| (size, (volume, slot))));
+        }
+        let mut groups = group_by_size(files);
+        groups.sort_by_key(|(size, members)| {
+            std::cmp::Reverse(size.saturating_mul(members.len() as u64 - 1))
+        });
+        let total_groups = groups.len() as u64;
+        let total_files = groups.iter().map(|(_, m)| m.len() as u64).sum();
+
+        let budget = request.max_files.min(MAX_DUPLICATE_FILES) as usize;
+        let mut used = 0usize;
+        let mut out = Vec::new();
+        for (size, members) in groups {
+            if used + members.len() > budget {
+                continue;
+            }
+            used += members.len();
+            let files = members
+                .into_iter()
+                .map(|(volume, slot)| {
+                    let index = ready[volume as usize].1;
+                    Row {
+                        path: index.path(slot),
+                        size: index.size(slot),
+                        mtime: index.mtime(slot),
+                        flags: index.flags(slot),
+                    }
+                })
+                .collect();
+            out.push(SizeGroup { size, files });
+        }
+        Response::DuplicateCandidates(DuplicateCandidatesResponse {
+            groups: out,
+            total_groups,
+            total_files,
             took_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             complete,
         })
@@ -1019,5 +1124,97 @@ mod tests {
             .as_ref()
             .map(|c| (c.generation, Arc::as_ptr(&c.totals)));
         assert_ne!(first.map(|c| c.0), third.map(|c| c.0));
+    }
+
+    /// C: with a\x.iso, a\y.iso, b\z.iso (3000 each), a\p.jpg, b\q.jpg (500 each) and a
+    /// lone 7000-byte file; D: with d.iso (3000).
+    fn duplicate_engine() -> Engine {
+        let mut c = Index::new(r"C:\", FoldOptions::default());
+        let mut d = Index::new(r"D:\", FoldOptions::default());
+        for (on_d, frn, parent, name, dir, size) in [
+            (false, 20, 5, "a", true, 0),
+            (false, 21, 20, "x.iso", false, 3000),
+            (false, 22, 20, "y.iso", false, 3000),
+            (false, 23, 20, "p.jpg", false, 500),
+            (false, 30, 5, "b", true, 0),
+            (false, 31, 30, "z.iso", false, 3000),
+            (false, 32, 30, "q.jpg", false, 500),
+            (false, 33, 30, "lone.bin", false, 7000),
+            (true, 20, 5, "d.iso", false, 3000),
+        ] {
+            let index = if on_d { &mut d } else { &mut c };
+            index.upsert(&NewEntry {
+                frn,
+                parent_frn: parent,
+                name: Name::Utf8(name),
+                attributes: if dir { 0x10 } else { 0x20 },
+                size,
+                alloc_size: size,
+                mtime: frn,
+            });
+        }
+        Engine::with_indexes(
+            vec![(info(r"C:\"), c), (info(r"D:\"), d)],
+            FoldOptions::default(),
+        )
+    }
+
+    fn candidates(engine: &Engine, roots: &[&str], filter: &str, max_files: u32) -> Response {
+        engine.handle(Request::DuplicateCandidates(DuplicateCandidatesRequest {
+            roots: roots.iter().map(|r| (*r).to_owned()).collect(),
+            min_size: 100,
+            filter: filter.into(),
+            max_files,
+        }))
+    }
+
+    #[test]
+    fn duplicate_candidates_across_volumes_and_roots() {
+        let engine = duplicate_engine();
+        let Response::DuplicateCandidates(all) = candidates(&engine, &[], "", 100) else {
+            panic!("candidates failed");
+        };
+        assert!(all.complete);
+        assert_eq!((all.total_groups, all.total_files), (2, 6));
+        // Most wasted bytes first: 3 * 3000 > 1 * 500.
+        assert_eq!(all.groups[0].size, 3000);
+        let paths: Vec<_> = all.groups[0]
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(paths.contains(&r"D:\d.iso"), "{paths:?}");
+        assert_eq!(all.groups[1].files.len(), 2);
+
+        let Response::DuplicateCandidates(a) = candidates(&engine, &[r"c:\A"], "", 100) else {
+            panic!("candidates failed");
+        };
+        assert_eq!(a.groups.len(), 1, "p.jpg has no twin inside C:\\a");
+        assert_eq!(a.groups[0].files.len(), 2);
+
+        // Overlapping roots do not list a file twice; the filter applies.
+        let Response::DuplicateCandidates(iso) =
+            candidates(&engine, &[r"C:\", r"C:\a"], "ext:iso", 100)
+        else {
+            panic!("candidates failed");
+        };
+        assert_eq!((iso.total_groups, iso.total_files), (1, 3));
+
+        // The file budget drops groups that do not fit, keeping smaller ones.
+        let Response::DuplicateCandidates(small) = candidates(&engine, &[], "", 3) else {
+            panic!("candidates failed");
+        };
+        assert_eq!(small.groups.len(), 1);
+        assert_eq!(small.groups[0].size, 500);
+        assert_eq!(small.total_files, 6);
+
+        let missing = candidates(&engine, &[r"C:\nope"], "", 100);
+        assert!(matches!(
+            missing,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
     }
 }

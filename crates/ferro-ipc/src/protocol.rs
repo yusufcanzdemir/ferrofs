@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change; both sides must agree (checked in the handshake).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Sent by the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,8 @@ pub enum Request {
     VolumeList,
     /// Folder sizes for the storage analyzer (SPEC §5.1).
     SizeTree(SizeTreeRequest),
+    /// Files of equal size, the first step of the duplicate finder (SPEC §5.2).
+    DuplicateCandidates(DuplicateCandidatesRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +75,18 @@ impl SizeTreeRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateCandidatesRequest {
+    /// Folders to search (duplicates may span them); empty = all volumes.
+    pub roots: Vec<String>,
+    /// Smaller files are ignored.
+    pub min_size: u64,
+    /// Query selecting the files to consider, e.g. `ext:jpg;png`; empty = all files.
+    pub filter: String,
+    /// Most files to return; groups that do not fit are left out (largest waste first).
+    pub max_files: u32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sort {
     #[default]
@@ -93,6 +107,7 @@ pub enum Response {
     Stats(Stats),
     Volumes(Vec<VolumeStatus>),
     SizeTree(SizeTreeResponse),
+    DuplicateCandidates(DuplicateCandidatesResponse),
     Error {
         code: ErrorCode,
         message: String,
@@ -174,6 +189,25 @@ pub struct ExtensionRow {
     pub size: u64,
     pub alloc_size: u64,
     pub files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateCandidatesResponse {
+    /// Groups of equal-size files, most wasted bytes (`size * (files - 1)`) first. Equal
+    /// size does not mean equal content: the client hashes them.
+    pub groups: Vec<SizeGroup>,
+    /// Groups and files before `max_files` was applied.
+    pub total_groups: u64,
+    pub total_files: u64,
+    pub took_us: u64,
+    /// False while some volumes are still being indexed.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeGroup {
+    pub size: u64,
+    pub files: Vec<Row>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
