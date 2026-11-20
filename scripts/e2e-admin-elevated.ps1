@@ -4,6 +4,8 @@
 # fixture is touched. Writes its report to <Out>\elevated.txt.
 param([string]$Repo, [string]$Out, [string]$Fixture)
 $ErrorActionPreference = 'Stop'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 $fx = $Fixture
 . (Join-Path $PSScriptRoot 'e2e-ui-helpers.ps1')
 Add-Type @'

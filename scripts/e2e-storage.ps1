@@ -8,6 +8,8 @@
 #   .\scripts\e2e-storage.ps1 -Repo $PWD -Root $PWD -Folder "$PWD\crates" -Out target\storage
 param([string]$Repo, [string]$Root, [string]$Folder, [string]$Out, [switch]$NoFake)
 $ErrorActionPreference = 'Stop'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class U {

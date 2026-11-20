@@ -6,6 +6,8 @@
 #   .\scripts\e2e-search.ps1 -Repo $PWD -Out target\search.png
 param([string]$Repo, [string]$Out, [string]$Query = 'app.rs')
 $ErrorActionPreference = 'Stop'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class U {

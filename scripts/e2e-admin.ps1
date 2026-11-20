@@ -16,6 +16,8 @@
 #   .\scripts\e2e-admin.ps1 -Repo $PWD -Out target\admin
 param([string]$Repo, [string]$Out, [switch]$ShotOnly)
 $ErrorActionPreference = 'Stop'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 . (Join-Path $PSScriptRoot 'e2e-ui-helpers.ps1')
 $script:failures = 0
 

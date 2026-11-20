@@ -10,6 +10,8 @@
 #   .\scripts\e2e-duplicates.ps1 -Repo $PWD -Out target\duplicates
 param([string]$Repo, [string]$Out)
 $ErrorActionPreference = 'Stop'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class U {

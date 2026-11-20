@@ -6,6 +6,8 @@
 # Writes target\e2e-service.ready and waits (up to 120 s) for target\e2e-service.done so an
 # unelevated shell can query the pipe too. Log: target\e2e-service.log
 $ErrorActionPreference = 'Continue'
+# Development pipe: never talk to (or collide with) an installed ferrofs service.
+$env:FERROFS_DEV_PIPE = 'ferrofs-dev'
 $repo = Split-Path $PSScriptRoot -Parent
 Set-Location $repo
 $exe = Join-Path $repo 'target\release\ferro-service.exe'
