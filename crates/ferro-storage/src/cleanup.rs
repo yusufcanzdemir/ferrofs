@@ -609,6 +609,10 @@ impl Cleanup {
                     .clicked()
             {
                 let mut args = String::from("--cleanup");
+                let folder = self.folder.trim().trim_end_matches('\\');
+                if !folder.is_empty() {
+                    args.push_str(&format!(" \"{folder}\""));
+                }
                 if self.dry_run_only {
                     args.push_str(" --dry-run");
                 }

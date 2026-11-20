@@ -56,6 +56,10 @@ pub fn relaunch_elevated(args: &str) -> Result<()> {
     };
     // Values <= 32 are errors (e.g. the UAC prompt was cancelled).
     if code.0 as isize <= 32 {
+        // SE_ERR_ACCESSDENIED: the prompt was declined (or timed out).
+        if code.0 as isize == 5 {
+            bail!("not restarted: the administrator prompt was declined");
+        }
         bail!("not restarted (error {})", code.0 as isize);
     }
     Ok(())

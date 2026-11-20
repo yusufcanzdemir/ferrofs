@@ -318,10 +318,13 @@ pub fn check_folder(folder: &str, windir: Option<&str>) -> Result<(), String> {
             );
         }
     }
-    if !path.is_dir() {
-        return Err(format!("{folder} is not a folder"));
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
+            "no access to {folder}; administrator rights may help"
+        )),
+        _ => Err(format!("{folder} is not a folder")),
     }
-    Ok(())
 }
 
 /// Compresses the candidates. With `dry_run` nothing is changed; the run is only logged.

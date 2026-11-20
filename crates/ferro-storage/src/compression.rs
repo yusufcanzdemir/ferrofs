@@ -73,6 +73,8 @@ pub struct Compression {
     stage: Stage,
     preview: Option<PreviewKind>,
     elevated: bool,
+    /// The folder could not be opened (access denied).
+    denied: bool,
     dry_run_only: bool,
     log: Option<ActionLog>,
     message: Option<String>,
@@ -115,6 +117,7 @@ impl Compression {
             stage: Stage::Idle,
             preview: None,
             elevated: elevation::is_elevated(),
+            denied: false,
             dry_run_only,
             log: ActionLog::default_file().map(ActionLog::new),
             message: None,
@@ -209,10 +212,13 @@ impl Compression {
             .trim_end_matches('\\')
             .to_owned();
         if let Err(reason) = compressor::check_folder(&folder, Self::windir().as_deref()) {
+            self.denied = reason.starts_with("no access");
+            self.folder.clone_from(&folder);
             self.error = Some(reason);
             return;
         }
         self.folder.clone_from(&folder);
+        self.denied = false;
         self.error = None;
         self.message = None;
         self.last = None;
@@ -419,7 +425,9 @@ impl Compression {
                     .on_hover_text("Needed for folders under Program Files")
                     .clicked()
             {
-                let mut args = format!("--compression \"{}\"", self.folder.trim());
+                // No trailing backslash: `\"` would escape the closing quote.
+                let folder = self.folder.trim().trim_end_matches('\\');
+                let mut args = format!("--compression \"{folder}\"");
                 if self.dry_run_only {
                     args.push_str(" --dry-run");
                 }
@@ -445,7 +453,10 @@ impl Compression {
             .iter()
             .filter_map(|name| std::env::var(name).ok())
             .any(|root| folder.starts_with(&root.to_lowercase()));
-        protected || self.last.as_ref().is_some_and(|s| s.access_denied)
+        protected
+            || self.denied
+            || self.last.as_ref().is_some_and(|s| s.access_denied)
+            || self.scan.as_ref().is_some_and(|s| s.unreadable.files > 0)
     }
 
     fn status(&mut self, ui: &mut egui::Ui) {
