@@ -82,9 +82,9 @@ if ($NoFake) {
   $fake = Start-Process (Join-Path $Repo 'target\debug\examples\fake_service.exe') -ArgumentList "`"$fx`"" -PassThru -WindowStyle Hidden
   Start-Sleep -Seconds 2
 }
-$saved = @{ TEMP = $env:TEMP; TMP = $env:TMP; LOCALAPPDATA = $env:LOCALAPPDATA; USERPROFILE = $env:USERPROFILE; CARGO_HOME = $env:CARGO_HOME; GRADLE_USER_HOME = $env:GRADLE_USER_HOME; WINDIR = $env:WINDIR; SystemRoot = $env:SystemRoot; SystemDrive = $env:SystemDrive }
+$saved = @{ TEMP = $env:TEMP; TMP = $env:TMP; LOCALAPPDATA = $env:LOCALAPPDATA; USERPROFILE = $env:USERPROFILE; CARGO_HOME = $env:CARGO_HOME; GRADLE_USER_HOME = $env:GRADLE_USER_HOME; WINDIR = $env:WINDIR; SystemDrive = $env:SystemDrive }
 $env:TEMP = "$fx\tmp"; $env:TMP = "$fx\tmp"; $env:LOCALAPPDATA = "$fx\local"; $env:USERPROFILE = "$fx\profile"
-$env:WINDIR = "$fx\windows"; $env:SystemRoot = "$fx\windows"; $env:SystemDrive = "$fx\drive"
+$env:WINDIR = "$fx\windows"; $env:SystemDrive = "$fx\drive"
 Remove-Item Env:CARGO_HOME, Env:GRADLE_USER_HOME -ErrorAction SilentlyContinue
 $env:FERROFS_DEV_ANY_SERVER = '1'
 $ui = Start-Process (Join-Path $Repo 'target\debug\ferro-storage.exe') -ArgumentList '--cleanup', "`"$fx\dev`"" -PassThru
