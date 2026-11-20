@@ -1,5 +1,6 @@
 //! MFT/USN reader, in-memory file index and query engine.
 
+pub mod duplicates;
 pub mod error;
 pub mod fold;
 pub mod index;

@@ -374,8 +374,9 @@ impl SizeTotals {
         Some(current)
     }
 
-    /// Predicate "this live file counts and lies below `folder`".
-    fn file_below(&self, index: &Index, folder: Option<u32>) -> impl Fn(u32) -> bool + Sync {
+    /// Predicate "this live file counts (matches the filter) and lies below `folder`"
+    /// (`None` = anywhere on the volume).
+    pub fn file_below(&self, index: &Index, folder: Option<u32>) -> impl Fn(u32) -> bool + Sync {
         // (lowest, highest) pre-order positions of the parent folder; `None` = only TOP.
         let range = match folder {
             None => Some((0, u32::MAX)),
