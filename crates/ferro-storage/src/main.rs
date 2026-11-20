@@ -2,11 +2,13 @@
 //! - analyzer (SPEC §5.1): folder sizes as a tree table and a treemap, with the largest
 //!   files and a per-extension breakdown;
 //! - duplicate finder (SPEC §5.2): equal-size files from the index, compared by content,
-//!   removed or replaced with hard links after a preview.
+//!   removed or replaced with hard links after a preview;
+//! - cleanup (SPEC §5.4): temporary files, package caches and build output.
 //!
 //! ```text
 //! ferro-storage [folder]                 analyzer at `folder` (default: all volumes)
 //! ferro-storage --duplicates [folder]    duplicate finder; searches `folder` right away
+//! ferro-storage --cleanup [folder]       cleanup; scans right away (build output in `folder`)
 //! ferro-storage --dry-run ...            destructive actions are only previewed and logged
 //! ```
 
@@ -15,9 +17,13 @@
 mod actions;
 mod analyzer;
 mod app;
+mod cleaner;
+mod cleanup;
 mod duplicates;
+mod elevation;
 mod format;
 mod hasher;
+mod locations;
 mod logging;
 mod paint;
 mod shell;
@@ -37,6 +43,7 @@ const TITLE: &str = "ferrofs storage";
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     duplicates: bool,
+    cleanup: bool,
     dry_run: bool,
     folder: Option<String>,
 }
@@ -46,6 +53,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
     for arg in args {
         match arg.as_str() {
             "--duplicates" => parsed.duplicates = true,
+            "--cleanup" => parsed.cleanup = true,
             "--dry-run" => parsed.dry_run = true,
             // `"C:\"` arrives as `C:"` because `\"` escapes the quote: trim quotes.
             _ => parsed.folder = Some(arg.trim().trim_matches('"').to_owned()),
@@ -77,7 +85,7 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let (jobs, outcomes) = worker::spawn(ctx.clone())?;
-            let analyzer_start = if args.duplicates {
+            let analyzer_start = if args.duplicates || args.cleanup {
                 String::new()
             } else {
                 args.folder.clone().unwrap_or_default()
@@ -90,8 +98,19 @@ fn main() -> Result<()> {
                 String::new()
             };
             let mut duplicates =
-                duplicates::Duplicates::new(ctx, jobs, outcomes, dup_folder, args.dry_run);
-            let tool = if args.duplicates {
+                duplicates::Duplicates::new(ctx.clone(), jobs, outcomes, dup_folder, args.dry_run);
+            let (jobs, outcomes) = worker::spawn(ctx.clone())?;
+            let clean_folder = if args.cleanup {
+                args.folder.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let mut cleanup =
+                cleanup::Cleanup::new(ctx, jobs, outcomes, clean_folder, args.dry_run);
+            let tool = if args.cleanup {
+                cleanup.scan();
+                Tool::Cleanup
+            } else if args.duplicates {
                 if args.folder.is_some() {
                     duplicates.start();
                 }
@@ -103,6 +122,7 @@ fn main() -> Result<()> {
                 tool,
                 analyzer,
                 duplicates,
+                cleanup,
                 args.dry_run,
             )))
         }),
@@ -128,8 +148,10 @@ mod tests {
                 duplicates: true,
                 dry_run: true,
                 folder: Some("C:".to_owned()),
+                ..Args::default()
             }
         );
         assert_eq!(parse(&[r"D:\Photos"]).folder.as_deref(), Some(r"D:\Photos"));
+        assert!(parse(&["--cleanup"]).cleanup);
     }
 }

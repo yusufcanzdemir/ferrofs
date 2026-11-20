@@ -151,13 +151,7 @@ pub fn recycle(path: &str, owner: Option<HWND>) -> Result<()> {
     unsafe {
         let operation: IFileOperation =
             CoCreateInstance(&FileOperation, None, CLSCTX_ALL).context("IFileOperation")?;
-        operation.SetOperationFlags(
-            FOF_ALLOWUNDO
-                | FOF_NOCONFIRMATION
-                | FOF_SILENT
-                | FOF_WANTNUKEWARNING
-                | windows::Win32::UI::Shell::FILEOPERATION_FLAGS(FOFX_RECYCLEONDELETE.0),
-        )?;
+        operation.SetOperationFlags(recycle_flags())?;
         if let Some(owner) = owner {
             operation.SetOwnerWindow(owner)?;
         }
@@ -173,6 +167,42 @@ pub fn recycle(path: &str, owner: Option<HWND>) -> Result<()> {
         bail!("still present after moving it to the Recycle Bin");
     }
     Ok(())
+}
+
+/// Moves several files or folders to the Recycle Bin in one shell operation. The caller
+/// checks afterwards which ones are gone (in-use items may be skipped in the shell's
+/// dialog). Same thread requirements as [`recycle`].
+pub fn recycle_many(paths: &[String], owner: Option<HWND>) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: as in `recycle`; every wide string outlives the calls that use it.
+    unsafe {
+        let operation: IFileOperation =
+            CoCreateInstance(&FileOperation, None, CLSCTX_ALL).context("IFileOperation")?;
+        operation.SetOperationFlags(recycle_flags())?;
+        if let Some(owner) = owner {
+            operation.SetOwnerWindow(owner)?;
+        }
+        for path in paths {
+            let file = wide(path);
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(file.as_ptr()), None)
+                .with_context(|| format!("cannot resolve {path}"))?;
+            operation.DeleteItem(&item, None)?;
+        }
+        operation.PerformOperations().context("the shell refused")?;
+    }
+    Ok(())
+}
+
+/// Recycle, never ask per item, show no progress, but warn before anything would be
+/// deleted for good (no Recycle Bin on the volume, or the item is too large for it).
+fn recycle_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
+    FOF_ALLOWUNDO
+        | FOF_NOCONFIRMATION
+        | FOF_SILENT
+        | FOF_WANTNUKEWARNING
+        | windows::Win32::UI::Shell::FILEOPERATION_FLAGS(FOFX_RECYCLEONDELETE.0)
 }
 
 /// Temporary name next to `path` for the new link.
@@ -234,8 +264,10 @@ impl ActionLog {
         &self.path
     }
 
-    fn record(&self, item: &Planned, disposal: Disposal, dry_run: bool, outcome: &Outcome) {
-        let line = entry(item, disposal, dry_run, outcome, SystemTime::now());
+    /// Appends one JSON object (with a leading `time` field) as one line. Errors are
+    /// logged, not returned: the action already happened.
+    pub fn append(&self, fields: &[(&str, Field<'_>)]) {
+        let line = json_line(fields, SystemTime::now());
         let written = self
             .path
             .parent()
@@ -251,41 +283,59 @@ impl ActionLog {
             tracing::error!("cannot write the action log {}: {err}", self.path.display());
         }
     }
+
+    /// Logs one duplicate action. Enough to undo: recycled files are restored from the
+    /// Recycle Bin by `path`; a hard-linked path gets its own copy of `kept` back, whose
+    /// content is identical (same `blake3`).
+    fn record(&self, item: &Planned, disposal: Disposal, dry_run: bool, outcome: &Outcome) {
+        let action = match (item.kind, disposal) {
+            (Kind::Remove, Disposal::RecycleBin) => "recycle",
+            (Kind::Remove, Disposal::Permanent) => "delete",
+            (Kind::HardLink, Disposal::RecycleBin) => "hardlink-recycle-original",
+            (Kind::HardLink, Disposal::Permanent) => "hardlink-delete-original",
+        };
+        let result = match outcome {
+            Outcome::Done => "ok".to_owned(),
+            Outcome::Logged => "dry-run".to_owned(),
+            Outcome::Skipped(reason) => format!("skipped: {reason}"),
+            Outcome::Failed(reason) => format!("failed: {reason}"),
+        };
+        self.append(&[
+            ("tool", Field::Str("duplicates")),
+            ("action", Field::Str(action)),
+            ("path", Field::Str(&item.path)),
+            ("kept", Field::Str(&item.keep)),
+            ("size", Field::Num(item.state.size)),
+            ("blake3", Field::Str(&item.hash)),
+            ("dry_run", Field::Bool(dry_run)),
+            ("result", Field::Str(&result)),
+        ]);
+    }
 }
 
-/// One log line (with the trailing newline). Enough to undo: recycled files are restored
-/// from the Recycle Bin by `path`; a hard-linked path gets its own copy of `kept` back,
-/// whose content is identical (same `blake3`).
-fn entry(
-    item: &Planned,
-    disposal: Disposal,
-    dry_run: bool,
-    outcome: &Outcome,
-    now: SystemTime,
-) -> String {
-    let action = match (item.kind, disposal) {
-        (Kind::Remove, Disposal::RecycleBin) => "recycle",
-        (Kind::Remove, Disposal::Permanent) => "delete",
-        (Kind::HardLink, Disposal::RecycleBin) => "hardlink-recycle-original",
-        (Kind::HardLink, Disposal::Permanent) => "hardlink-delete-original",
-    };
-    let result = match outcome {
-        Outcome::Done => "ok".to_owned(),
-        Outcome::Logged => "dry-run".to_owned(),
-        Outcome::Skipped(reason) => format!("skipped: {reason}"),
-        Outcome::Failed(reason) => format!("failed: {reason}"),
-    };
-    format!(
-        "{{\"time\":{},\"tool\":\"duplicates\",\"action\":{},\"path\":{},\"kept\":{},\"size\":{},\"blake3\":{},\"dry_run\":{},\"result\":{}}}\n",
-        json_string(&utc_timestamp(now)),
-        json_string(action),
-        json_string(&item.path),
-        json_string(&item.keep),
-        item.state.size,
-        json_string(&item.hash),
-        dry_run,
-        json_string(&result),
-    )
+/// A value in an action log line.
+#[derive(Debug, Clone, Copy)]
+pub enum Field<'a> {
+    Str(&'a str),
+    Num(u64),
+    Bool(bool),
+}
+
+/// `{"time":"…",<fields>}` plus a newline.
+fn json_line(fields: &[(&str, Field<'_>)], now: SystemTime) -> String {
+    let mut line = format!("{{\"time\":{}", json_string(&utc_timestamp(now)));
+    for (name, value) in fields {
+        line.push(',');
+        line.push_str(&json_string(name));
+        line.push(':');
+        match value {
+            Field::Str(text) => line.push_str(&json_string(text)),
+            Field::Num(n) => line.push_str(&n.to_string()),
+            Field::Bool(b) => line.push_str(if *b { "true" } else { "false" }),
+        }
+    }
+    line.push_str("}\n");
+    line
 }
 
 /// JSON string literal (RFC 8259 escaping).
@@ -458,6 +508,14 @@ mod tests {
             "\"C:\\\\a \\\"b\\\"\\n\\u0001\""
         );
         assert_eq!(utc_timestamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        let line = json_line(
+            &[("a", Field::Num(3)), ("b", Field::Bool(false))],
+            UNIX_EPOCH,
+        );
+        assert_eq!(
+            line,
+            "{\"time\":\"1970-01-01T00:00:00Z\",\"a\":3,\"b\":false}\n"
+        );
         let t = UNIX_EPOCH + Duration::from_secs(1_795_000_000);
         assert_eq!(utc_timestamp(t), "2026-11-18T11:06:40Z");
         let leap = UNIX_EPOCH + Duration::from_secs(951_782_400); // 2000-02-29

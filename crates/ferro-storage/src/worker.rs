@@ -20,6 +20,12 @@ pub enum JobKind {
     Expand(String),
     /// Find equal-size duplicate candidates.
     Duplicates,
+    /// Find developer artifacts.
+    Artifacts,
+    /// Size of the well-known cleanup location with this index.
+    Location(usize),
+    /// Find virtual disk files.
+    VirtualDisks,
 }
 
 #[derive(Debug)]

@@ -246,7 +246,13 @@ impl Analyzer {
                         }
                     }
                 }
-                (JobKind::Duplicates, _) => {}
+                (
+                    JobKind::Duplicates
+                    | JobKind::Artifacts
+                    | JobKind::Location(_)
+                    | JobKind::VirtualDisks,
+                    _,
+                ) => {}
             }
         }
     }
