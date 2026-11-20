@@ -11,7 +11,7 @@ use ferro_ipc::{
 };
 
 /// Set to `1` to accept a service that is not running as a Windows service
-/// (e.g. `ferro-service run --console` or the `fake_service` example) while developing.
+/// (e.g. `ferro-service run --console` or ferro-service's `fake_service` example) while developing.
 const DEV_TRUST_ENV: &str = "FERROFS_DEV_ANY_SERVER";
 
 #[derive(Debug)]

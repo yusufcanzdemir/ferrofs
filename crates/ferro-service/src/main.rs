@@ -6,10 +6,10 @@
 //! ferro-service run --console    run in the foreground for debugging (elevated, Ctrl+C stops)
 //! ferro-service status           volume states, via the pipe
 //! ferro-service query <text>     search, via the pipe
+//! ferro-service sizes [folder]   folder sizes and largest files, via the pipe
 //! ```
 //! Without arguments the binary expects to be started by the service control manager.
 
-mod engine;
 mod logging;
 mod service;
 mod snapshots;
@@ -22,13 +22,14 @@ use anyhow::{Context, Result, bail};
 use ferro_core::FoldOptions;
 use ferro_core::volume::fixed_volumes;
 use ferro_ipc::{
-    Client, PIPE_NAME, PipeServer, Request, Response, SearchRequest, ServerTrust, StopSignal,
+    Client, PIPE_NAME, PipeServer, Request, Response, SearchRequest, ServerTrust, SizeTreeRequest,
+    StopSignal,
 };
 use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::core::BOOL;
 
-use crate::engine::Engine;
+use ferro_service::engine::Engine;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -48,8 +49,9 @@ fn main() -> Result<()> {
         ["uninstall"] => service::uninstall(),
         ["status"] => status(),
         ["query", words @ ..] => query(&words.join(" ")),
+        ["sizes", folder @ ..] => sizes(&folder.join(" ")),
         _ => bail!(
-            "usage: ferro-service [install | uninstall | run --console | status | query <text>]"
+            "usage: ferro-service [install | uninstall | run --console | status | query <text> | sizes [folder]]"
         ),
     }
 }
@@ -160,6 +162,55 @@ fn query(text: &str) -> Result<()> {
                     " (indexing not finished)"
                 }
             );
+            Ok(())
+        }
+        Response::Error { code, message } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+/// Prints the size tree below `root` (empty = all volumes) and timing, for manual checks.
+fn sizes(root: &str) -> Result<()> {
+    let mut client = connect()?;
+    let mut request = SizeTreeRequest::new(root, 1);
+    request.max_children = 20;
+    request.top_files = 10;
+    request.top_extensions = 10;
+    match client.request(&Request::SizeTree(request))? {
+        Response::SizeTree(tree) => {
+            let gb = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+            println!(
+                "{}  {:.2} GB ({:.2} GB on disk), {} files, {} folders",
+                if tree.path.is_empty() {
+                    "all volumes"
+                } else {
+                    &tree.path
+                },
+                gb(tree.root.size),
+                gb(tree.root.alloc_size),
+                tree.root.files,
+                tree.root.folders
+            );
+            for child in &tree.root.children {
+                println!("{:>10.2} GB  {}", gb(child.size), child.name);
+            }
+            if let Some(rest) = &tree.root.rest {
+                println!("{:>10.2} GB  ({} more)", gb(rest.size), rest.count);
+            }
+            println!("-- largest files");
+            for row in &tree.largest {
+                println!("{:>10.2} GB  {}", gb(row.size), row.path);
+            }
+            println!("-- extensions");
+            for ext in &tree.extensions {
+                println!(
+                    "{:>10.2} GB  .{} ({} files)",
+                    gb(ext.size),
+                    ext.ext,
+                    ext.files
+                );
+            }
+            println!("-- {:.2} ms", tree.took_us as f64 / 1000.0);
             Ok(())
         }
         Response::Error { code, message } => bail!("{code:?}: {message}"),

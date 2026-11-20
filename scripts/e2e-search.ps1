@@ -1,8 +1,8 @@
-# End-to-end test for ferro-search against the fake_service example (no admin needed).
+# End-to-end test for ferro-search against the ferro-service fake_service example (no admin needed).
 # Uses a throwaway %APPDATA% and %LOCALAPPDATA% (config with a custom hotkey, history,
 # logs), toggles the window, checks copy path / copy file / click-to-copy-folder /
 # reveal, and saves a screenshot of the window only (PrintWindow).
-#   cargo build -p ferro-search --examples; cargo build -p ferro-search
+#   cargo build -p ferro-service --examples; cargo build -p ferro-search
 #   .\scripts\e2e-search.ps1 -Repo $PWD -Out target\search.png
 param([string]$Repo, [string]$Out, [string]$Query = 'app.rs')
 $ErrorActionPreference = 'Stop'
